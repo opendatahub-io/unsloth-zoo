@@ -14,7 +14,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import torch
+try:
+    import torch
+except ImportError:
+    # MLX (Apple Silicon) is torch-free. Only the embedding-fix helpers below use
+    # torch and they are never called on MLX, so keep the module importable so the
+    # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
+    torch = None
+import functools
 import gc
 import numpy as np
 import itertools
@@ -30,7 +37,19 @@ __all__ = [
 ]
 
 
-@torch.inference_mode
+def _maybe_inference_mode(func):
+    """torch.inference_mode when torch is present; a plain passthrough on torch-free
+    installs (MLX), where these torch-only helpers are never invoked."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch is None:
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+@_maybe_inference_mode
 def mean_of_trained_tokens(model, eps = 1e-16):
     """
     Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
@@ -119,24 +138,35 @@ def add_new_tokens(
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
     new_vocab_length = len(tokenizer)
+    # Some models ship an embedding that is padded LARGER than the tokenizer
+    # vocab (e.g. Gemma3: 262208 embedding rows vs 262145 tokens). Resizing to
+    # new_vocab_length would then SHRINK the matrix and silently destroy the
+    # already-trained rows past the tokenizer length. Never resize below the
+    # existing embedding: grow only when the new tokens overflow the padding.
+    # new_vocab_length already includes the freshly added tokens, so do NOT add
+    # their count again here.
+    resize_target = max(old_input_length, old_output_length, new_vocab_length)
     # Also resizes lm_head as well!
-    model.resize_token_embeddings(new_vocab_length)
+    model.resize_token_embeddings(resize_target)
 
     # If we use interpolation, we interpolate between the mean embeddings and
     # the Word2Vec sum of the other vectors
     embedding_matrix = model.get_input_embeddings ().weight
     lm_head_matrix   = model.get_output_embeddings().weight
 
-    # Confirm sizes are correct
-    if embedding_matrix.shape[0] != new_vocab_length:
+    # Confirm sizes are correct. Compare against resize_target (not
+    # new_vocab_length): for padded embeddings the matrices keep their larger
+    # row count. The old check compared against new_vocab_length, so on a padded
+    # model it either never fired (masking the silent shrink) or fired spuriously.
+    if embedding_matrix.shape[0] != resize_target:
         raise RuntimeError(
             "Unsloth: Embedding matrix size did not get resized properly. Please file a bug report!"
         )
-    if lm_head_matrix.shape[0]   != new_vocab_length:
+    if lm_head_matrix.shape[0]   != resize_target:
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != new_vocab_length:
+    if model.config.vocab_size   != resize_target:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )
@@ -162,10 +192,13 @@ def add_new_tokens(
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
         pass
     else:
-        # Now set the new tokens to the mean!
+        # Now set the new tokens to the mean! Only touch the genuinely-new rows
+        # [old_length:new_vocab_length]; on a padded embedding the rows past
+        # new_vocab_length are the model's original alignment padding and must be
+        # left as shipped (the old [old_length:] slice overwrote those too).
         with torch.no_grad():
-            embedding_matrix[old_length:] = mean_embedding
-            lm_head_matrix  [old_length:] = mean_lm_head
+            embedding_matrix[old_length:new_vocab_length] = mean_embedding
+            lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
     pass
 
     # We set a flag to say we need to train embeddings
@@ -176,15 +209,18 @@ def add_new_tokens(
     pass
     internal_model._need_to_train_embeddings = True
 
-    # Fix up all vocab sizes
+    # Fix up all vocab sizes. Use resize_target, not len(tokenizer): config
+    # vocab_size must equal the actual embedding / lm_head row count or the model
+    # cannot round-trip through save_pretrained/from_pretrained (state_dict shape
+    # mismatch). For a padded embedding these differ.
     current_model = model
     while hasattr(current_model, "model") and hasattr(current_model, "config"):
         if hasattr(current_model.config, "vocab_size"):
-            current_model.config.update({"vocab_size" : len(tokenizer)})
+            current_model.config.update({"vocab_size" : resize_target})
         current_model = current_model.model
     if hasattr(current_model, "model") and hasattr(current_model, "config"):
         if hasattr(current_model.config, "vocab_size"):
-            current_model.config.update({"vocab_size" : len(tokenizer)})
+            current_model.config.update({"vocab_size" : resize_target})
     pass
 
     # Must tie lm_head and embed_tokens if they are tied!
@@ -199,7 +235,7 @@ def add_new_tokens(
 pass
 
 
-@torch.inference_mode
+@_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
     Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
@@ -211,8 +247,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
-    # Ignore some model checks for now
-    if model.config._name_or_path in IGNORED_TOKENIZER_NAMES:
+    # Ignore some model checks for now. Normalize both the model name and caller-
+    # provided entries so the comparison is case-insensitive in either direction.
+    model_name = model.config._name_or_path
+    ignored_tokenizer_names = {
+        name.lower() for name in IGNORED_TOKENIZER_NAMES
+    }
+    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
         return
     pass
 
@@ -465,7 +506,7 @@ from .pad_token import (
     VISION_RESERVED_TOKENS,
 )
 
-@torch.inference_mode
+@_maybe_inference_mode
 def patch_tokenizer(model, tokenizer):
     """
         Set a sensible pad_token when missing (Phi3 -> <|placeholder...,
