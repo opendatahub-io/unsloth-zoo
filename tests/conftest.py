@@ -263,6 +263,26 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
         yield
 
 
+# grpo_accumulated_loss sets UNSLOTH_RETURN_HIDDEN_STATES=1 and only resets it on its way out, so
+# a test that stops it part way (test_grpo_autotune_per_step raises _Stop from inside it) leaves the
+# flag on for the rest of its xdist worker. Every patched causal LM forward then returns hidden
+# states and loss=None, and test_gpt_oss_router_logits_capture failed on
+# `'NoneType' object has no attribute 'backward'` whenever it followed one of those on a worker.
+import os as _os
+
+_HIDDEN_STATES_FLAG = "UNSLOTH_RETURN_HIDDEN_STATES"
+
+
+@_pytest.fixture(autouse = True)
+def _restore_hidden_states_flag():
+    before = _os.environ.get(_HIDDEN_STATES_FLAG)
+    yield
+    if before is None:
+        _os.environ.pop(_HIDDEN_STATES_FLAG, None)
+    else:
+        _os.environ[_HIDDEN_STATES_FLAG] = before
+
+
 # A test that swaps a module into sys.modules and does not swap it back breaks whatever
 # imports that name later IN THE SAME PROCESS. Serially that is often invisible, because
 # the victim happens to sort before the polluter and never sees it; under pytest-xdist a
@@ -328,6 +348,18 @@ def _is_module_stub(mod):
     return mod is not None and getattr(mod, "__file__", None) is None
 
 
+def _is_unsloth_stub(mod):
+    """unsloth_zoo installs its own bitsandbytes stub where no real wheel exists, which
+    is every Apple Silicon machine (stubs/bitsandbytes_stub.py). The finder mints
+    submodules on first import, so the first test to import anything that touches
+    bitsandbytes.nn looks like a polluter while doing nothing wrong: the stub is
+    process wide, deliberate and idempotent, and putting it "back" would mean deleting
+    a module the rest of the session expects. Every stub module carries the marker,
+    finder-minted ones included.
+    """
+    return bool(getattr(mod, "IS_UNSLOTH_STUB", False))
+
+
 def pytest_runtest_setup(item):
     import sys as _sys
 
@@ -364,10 +396,10 @@ def pytest_runtest_teardown(item, nextitem):
             if _is_from_pytest_tmp(now):
                 leaked.append(name)
             continue
-        if was is None and not _is_module_stub(now):
-            # Nothing was there and the test imported the real thing. That is an
-            # import, not a swap, and flagging it would fail every test that touches
-            # the package.
+        if was is None and (not _is_module_stub(now) or _is_unsloth_stub(now)):
+            # Nothing was there and the test imported the real thing, or the zoo's own
+            # bitsandbytes stub. Either is an import, not a swap, and flagging it would
+            # fail every test that touches the package.
             continue
         leaked.append(name)
     if leaked:
