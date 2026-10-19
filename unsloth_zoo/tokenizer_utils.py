@@ -21,12 +21,17 @@ except ImportError:
     # torch and they are never called on MLX, so keep the module importable so the
     # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
     torch = None
+import copy
+import copyreg
 import functools
 import gc
+import inspect
 import numpy as np
 import itertools
 import datasets
 import re
+
+from .log import logger
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -60,7 +65,8 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     lm_head_matrix   = model.get_output_embeddings().weight.clone()
 
     # Get untrained tokens
-    indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
@@ -104,6 +110,10 @@ def add_new_tokens(
     assert(method == "mean" or method == "interpolation")
     assert(interpolation >= 0 and interpolation <= 1)
 
+    # Vision models hand back a processor; its inner tokenizer owns the vocab.
+    if not hasattr(tokenizer, "add_tokens") and hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
+
     # Check if tokens already exist
     overlapping_tokens = set(new_tokens) & set(tokenizer.vocab.keys())
     if len(overlapping_tokens) != 0:
@@ -128,11 +138,18 @@ def add_new_tokens(
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
     old_output_length = old_output_embedding.shape[0]
-    old_config_size   = model.config.vocab_size
+    # Composite configs (Gemma3Config) keep vocab_size on text_config.
+    text_config       = model.config.get_text_config()
 
     # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
         or (model.config.tie_word_embeddings)
+
+    # Tokenize before add_tokens: afterwards each token maps to its own fresh row.
+    if method == "interpolation":
+        new_token_pieces = [
+            tokenizer(token, add_special_tokens = False).input_ids for token in new_tokens
+        ]
 
     # Add tokens!
     old_length = len(tokenizer)
@@ -166,7 +183,7 @@ def add_new_tokens(
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != resize_target:
+    if text_config.vocab_size    != resize_target:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )
@@ -177,10 +194,13 @@ def add_new_tokens(
             "Unsloth: You are using interpolation to add new tokens.\n"\
             f"We shall set new tokens = mean(embeddings)*{1-interpolation} + mean(new_tokens)*{interpolation}"
         )
-        for j, token in enumerate(new_tokens):
-            input_ids = tokenizer(token, add_special_tokens = False).input_ids
-            mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
-            mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
+        for j, input_ids in enumerate(new_token_pieces):
+            # T5-style tokenizers split whitespace-only strings into no pieces; a mean of none is NaN.
+            if len(input_ids) == 0:
+                mean_embedding_token, mean_lm_head_token = mean_embedding, mean_lm_head
+            else:
+                mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
+                mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
             # Interpolate
             mean_embedding_token = mean_embedding*(1-interpolation) + mean_embedding_token*interpolation
@@ -235,6 +255,84 @@ def add_new_tokens(
 pass
 
 
+# datasets' own Dataset.map(batched=True) default, so both paths allocate the same size.
+_COUNT_INPUT_IDS_BATCH_SIZE = 1000
+
+
+def _count_input_ids(train_dataset, mapping):
+    """Only .map is datasets specific; a plain list of rows gets this far. A row with no
+    "input_ids" is skipped, as in the checks above."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if hasattr(train_dataset, "map"):
+        train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+        return
+    pass
+    # `mapping` flattens its batch into one array, so passing the whole dataset is an
+    # O(total tokens) transient. Chunking is exactly equivalent because it accumulates into
+    # a counter and .map(batched=True) already calls it once per batch.
+    batch = []
+    for row in train_dataset:
+        if "input_ids" not in row: continue
+        batch.append(row["input_ids"])
+        if len(batch) >= _COUNT_INPUT_IDS_BATCH_SIZE:
+            mapping({"input_ids" : batch})
+            batch = []
+        pass
+    pass
+    if batch: mapping({"input_ids" : batch})
+pass
+
+
+def _requires_arguments(method):
+    """True only when binding zero arguments fails. Unreadable metadata counts as callable."""
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError, AttributeError):
+        # signature() raises TypeError for unreadable metadata too, so the lookup
+        # cannot share a try with bind(): only bind() failing proves arguments.
+        return False
+    try:
+        signature.bind()
+    except TypeError:
+        return True
+    return False
+pass
+
+
+_LANGUAGE_CORE_NAMES = frozenset(("language_model", "thinker", "text_model"))
+
+
+def _get_embedding_modules(model):
+    """(input embeddings, lm_head) through headless wrappers (Nemotron-3-Nano-Omni); only arg-requiring or NotImplementedError accessors read as None."""
+    def _own(module, name):
+        getter = getattr(module, name, None)
+        if not callable(getter): return None
+        if _requires_arguments(getter): return None
+        try: return getter()
+        except NotImplementedError: return None
+    embeddings = _own(model, "get_input_embeddings")
+    lm_head    = _own(model, "get_output_embeddings")
+    if lm_head is None:
+        candidates = []
+        for name, module in model.named_modules():
+            if module is model: continue
+            nested_head = _own(module, "get_output_embeddings")
+            if nested_head is None: continue
+            candidates.append((name, nested_head, _own(module, "get_input_embeddings")))
+        # Prefer the head beside the top-level embeddings: first-registered may be a vision decoder (silently corrupted).
+        for _, nested_head, nested_embeddings in candidates:
+            if embeddings is not None and nested_embeddings is embeddings:
+                return embeddings, nested_head
+        # Several heads (Qwen3-Omni: thinker, talker.code_predictor): only a language-model name disambiguates, else skip.
+        if len(candidates) > 1:
+            candidates = [c for c in candidates if c[0].rsplit(".", 1)[-1] in _LANGUAGE_CORE_NAMES]
+        if len(candidates) == 1:
+            _, lm_head, nested_embeddings = candidates[0]
+            if nested_embeddings is not None: embeddings = nested_embeddings
+    return embeddings, lm_head
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -242,8 +340,35 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    embedding_matrix = model.get_input_embeddings ().weight
-    lm_head_matrix   = model.get_output_embeddings().weight
+    # Not every checkpoint has a single embedding to reset, and `hasattr` does not
+    # say so: transformers' base get_input_embeddings raises NotImplementedError
+    # for composite models (Qwen3-Omni), and remote code can declare a signature
+    # that cannot be called (stepfun-ai/Step-3.7-Flash).
+    embeddings, lm_head = _get_embedding_modules(model)
+    if embeddings is None or lm_head is None or \
+        getattr(embeddings, "weight", None) is None or getattr(lm_head, "weight", None) is None:
+        # Warning, not info: the logger sits at WARNING by default and this run
+        # just lost the NaN guard.
+        logger.warning(
+            f"Unsloth: Skipping the untrained token fix for "
+            f"{type(model).__name__}, which does not expose a single input "
+            f"embedding."
+        )
+        return
+    # DeepSpeed ZeRO-3 partitioned the weights to empty placeholders: gather them outside inference mode
+    # (all-gather writes param.data) and let rank 0's reset reach every partition (unsloth#225).
+    partitioned = []
+    for weight in (embeddings.weight, lm_head.weight):
+        status = getattr(getattr(weight, "ds_status", None), "name", None)
+        if status == "NOT_AVAILABLE" and all(weight is not w for w in partitioned):
+            partitioned.append(weight)
+    if partitioned:
+        import deepspeed
+        with torch.inference_mode(False), \
+            deepspeed.zero.GatheredParameters(partitioned, modifier_rank = 0), torch.inference_mode():
+            return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
+    embedding_matrix = embeddings.weight
+    lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
@@ -264,11 +389,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
     # Get untrained tokens
-    indicator_untrained1 = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     # Check lm_head as well
 
     # Does NOT work for Llama 3.1!!
-    indicator_untrained2 = torch.amax(lm_head_matrix,   axis = 1) <= eps
+    indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
+        (torch.amin(lm_head_matrix, axis = 1) >= -eps)
 
     # We instead check for repeated vectors
     lm_head_where = torch.where(indicator_untrained1)[0]
@@ -458,7 +585,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+    _count_input_ids(train_dataset, mapping)
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
@@ -575,6 +702,35 @@ def _is_conversation_format(text):
 pass
 
 
+def _patched_processor_reduce_ex(self, protocol):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Patched class is not importable by name, so pickle as the stock class (spawn workers, AsyncGRPO).
+    state = dict(self.__dict__)
+    state.pop("_unsloth_patched_call", None)
+    # copyreg.__newobj__ insists on the instance's own class; _reconstructor does not.
+    return (copyreg._reconstructor, (type(self)._unsloth_original_class, object, None), state)
+pass
+
+
+def _patched_processor_copy(self):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # In-process copies keep the patched class (__reduce_ex__ would drop it).
+    new = type(self).__new__(type(self))
+    new.__dict__.update(self.__dict__)
+    return new
+pass
+
+
+def _patched_processor_deepcopy(self, memo):
+    # All Unsloth Zoo code licensed under LGPLv3
+    new = type(self).__new__(type(self))
+    memo[id(self)] = new
+    for key, value in self.__dict__.items():
+        new.__dict__[key] = copy.deepcopy(value, memo)
+    return new
+pass
+
+
 def patch_processor_call(processor):
     """
     Patch processor's __call__ to auto-apply the chat template when text is in
@@ -590,8 +746,21 @@ def patch_processor_call(processor):
         return processor
 
     original_call = processor.__class__.__call__
+    # Positional order differs per processor: Qwen3-Omni takes (text, images, ...).
+    try:
+        parameters = list(inspect.signature(original_call).parameters.values())[1:]
+    except (TypeError, ValueError):
+        parameters = []
+    text_index = next(
+        (i for i, p in enumerate(parameters)
+         if p.name == "text" and p.kind is p.POSITIONAL_OR_KEYWORD),
+        None,
+    )
 
-    def patched_call(self, images=None, text=None, videos=None, **kwargs):
+    def patched_call(self, *args, **kwargs):
+        args = list(args)
+        text_in_args = text_index is not None and text_index < len(args)
+        text = args[text_index] if text_in_args else kwargs.get("text")
         if text is not None and _is_conversation_format(text):
             add_generation_prompt = kwargs.pop("add_generation_prompt", True)
             text = self.apply_chat_template(
@@ -599,7 +768,11 @@ def patch_processor_call(processor):
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
             )
-        return original_call(self, images=images, text=text, videos=videos, **kwargs)
+            if text_in_args:
+                args[text_index] = text
+            else:
+                kwargs["text"] = text
+        return original_call(self, *args, **kwargs)
 
     # Patch via a dynamic subclass reusing the original class name so
     # save_pretrained writes the correct processor_class (fixes issue #4085).
@@ -611,6 +784,10 @@ def patch_processor_call(processor):
             "__call__": patched_call,
             "__module__": original_class.__module__,
             "__qualname__": original_class.__qualname__,
+            "_unsloth_original_class": original_class,
+            "__reduce_ex__": _patched_processor_reduce_ex,
+            "__copy__": _patched_processor_copy,
+            "__deepcopy__": _patched_processor_deepcopy,
         }
     )
     processor.__class__ = patched_class

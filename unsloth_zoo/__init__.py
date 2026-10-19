@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.9.3"
+__version__ = "2026.10.6"
 
 import os
 import platform
@@ -67,11 +67,28 @@ def _detect_windows_on_arm() -> bool:
 
 _windows_on_arm = _detect_windows_on_arm()
 
+# Only when hf_transfer is importable: huggingface_hub < 1.0 honours the flag and refuses every
+# download ("'hf_transfer' package is not available") when it is not, as after a --no-deps install.
+import importlib.util as _importlib_util
+
+
+def _hf_transfer_importable() -> bool:
+    try:
+        return _importlib_util.find_spec("hf_transfer") is not None
+    except (ImportError, ValueError):
+        # A stub placed in sys.modules without a __spec__ makes find_spec raise; importing
+        # unsloth_zoo must not fail on it, and a stub is not the real downloader.
+        return False
+
+
+_hf_transfer_installed = _hf_transfer_importable()
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
 if (
     "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
     and not _offline_env
     and not _windows_on_arm
+    and _hf_transfer_installed
 ):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
@@ -279,10 +296,27 @@ if not _SKIP_GPU_INIT:
     IS_TORCH_2_10_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 10)
     IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
     # expandable_segments is unsupported on Windows/WSL.
-    IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
+    def _is_wsl():
+        if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+            return True
+        # Docker on WSL2 has no WSL_* variables but shares the *-microsoft-standard-WSL2 kernel,
+        # where expandable_segments dies with `CUDA driver error: unknown error` (unslothai/unsloth#3511).
+        try:
+            return "microsoft" in os.uname().release.lower()
+        except Exception:
+            return False
+    IS_WSL_OR_WINDOWS = os.name == "nt" or _is_wsl()
+    del _is_wsl
+
+    # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
+    # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
+    # free (unslothai/unsloth#2401). Detection is filesystem only because this runs before
+    # torch is imported; see unsloth_zoo/integrated_device.py.
+    from .integrated_device import expandable_segments_unsupported
+    EXPANDABLE_SEGMENTS_UNSUPPORTED = expandable_segments_unsupported()
 
     # Reduce VRAM fragmentation and optimize memory pinning
-    if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
+    if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0" and not EXPANDABLE_SEGMENTS_UNSUPPORTED:
         if IS_TORCH_2_10_OR_NEWER:
             if "PYTORCH_ALLOC_CONF" not in os.environ:
                 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -357,6 +391,14 @@ if not _SKIP_GPU_INIT:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
+    # IMPORTANT: same ordering rule as the ROCm cleanup below. Adds nothing back, unlike the
+    # WSL branch: a unified-memory board has no separate VRAM pool to defragment, and rounding
+    # every block up would waste the system RAM the model is competing for.
+    if EXPANDABLE_SEGMENTS_UNSUPPORTED:
+        remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_ALLOC_CONF")
+
     # IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
     # HIP allocator settings can be read during torch initialization.
     if IS_TORCH_ROCM_BUILD:
@@ -397,8 +439,12 @@ if not _SKIP_GPU_INIT:
             promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
             if promoted is None:
                 promoted = _ORIGINAL_PYTORCH_HIP_ALLOC_CONF
-            # Keep standby + ROCm protections when promoting legacy values.
-            if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1" or IS_TORCH_ROCM_BUILD:
+            # Keep standby + ROCm + Tegra protections when promoting legacy values.
+            if (
+                os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1"
+                or IS_TORCH_ROCM_BUILD
+                or EXPANDABLE_SEGMENTS_UNSUPPORTED
+            ):
                 promoted = clean_expandable_segments_value(promoted)
             if promoted is not None:
                 os.environ["PYTORCH_ALLOC_CONF"] = promoted
@@ -503,6 +549,7 @@ if not _SKIP_GPU_INIT:
         del _torch, _rocm_arch, _sys, _user_blas, _user_wants_lt
     del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_10_OR_NEWER, IS_WSL_OR_WINDOWS, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
     del clean_expandable_segments_value
+    del expandable_segments_unsupported, EXPANDABLE_SEGMENTS_UNSUPPORTED
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
     if not ("UNSLOTH_IS_PRESENT" in os.environ):

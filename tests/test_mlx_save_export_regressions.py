@@ -1788,9 +1788,11 @@ def test_vlm_sanitizer_replay_uses_real_model_instances():
     ) == {"visual.proj.weight": "tensor"}
 
 
+@pytest.mark.parametrize("trust", [False, True])
 def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     monkeypatch,
     tmp_path,
+    trust,
 ):
     import unsloth_zoo.mlx.loader as loader
 
@@ -1809,13 +1811,11 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     )
 
     image_processor = object()
-    monkeypatch.setattr(
-        loader,
-        "_build_vlm_image_processor_from_config",
-        lambda model_path, processor_config, preprocessor_config, model_type=None: (
-            image_processor
-        ),
-    )
+    def build_image_processor(*args, **kwargs):
+        assert kwargs["trust_remote_code"] is trust
+        return image_processor
+
+    monkeypatch.setattr(loader, "_build_vlm_image_processor_from_config", build_image_processor)
 
     (tmp_path / "processor_config.json").write_text(
         json.dumps({"processor_class": "FakeProcessor"}),
@@ -1839,6 +1839,7 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
         degraded,
         tmp_path,
         "glm_ocr",
+        trust_remote_code=trust,
     )
 
     assert isinstance(repaired, FakeProcessor)
@@ -1862,6 +1863,8 @@ def test_processor_loader_is_call_scoped_and_preserves_failure_policy(
         @classmethod
         def from_pretrained(cls, _path, **kwargs):
             calls.append(kwargs["trust_remote_code"])
+            if cls.error is None:
+                return tokenizer
             raise cls.error
 
     monkeypatch.setitem(globals(), "AutoProcessor", FakeAutoProcessor)
@@ -1876,6 +1879,14 @@ def test_processor_loader_is_call_scoped_and_preserves_failure_policy(
     assert scoped(tmp_path) is native and trusted(tmp_path) is native
     assert calls == [False, True] and load_processor is _test_bound_load_processor
     assert AutoProcessor is FakeAutoProcessor
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"word": 0})))
+    FakeAutoProcessor.error = None
+    assert scoped(tmp_path) is native
+    tokenizer.image_processor = object()
+    assert scoped(tmp_path) is tokenizer
     FakeAutoProcessor.error = RuntimeError("unrelated")
     with pytest.raises(RuntimeError, match="unrelated"):
         scoped(tmp_path)
@@ -2092,6 +2103,51 @@ def test_minicpmo_vision_dtype_adapter_is_scoped_and_fail_closed(monkeypatch):
     assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_fixed_vision) is _test_minicpmo_fixed_vision
     monkeypatch.setattr(_test_minicpmo_legacy_vision, "__module__", "foreign")
     assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision) is _test_minicpmo_legacy_vision
+
+
+def test_qwen3_omni_audio_clips_are_encoded_one_at_a_time(monkeypatch):
+    """mlx-vlm 0.7.4 fills a second clip's positions from the first clip's chunks."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = []
+
+    def get_audio_features(self, input_features, feature_attention_mask=None,
+                           audio_feature_lengths=None):
+        calls.append((input_features.shape[0], feature_attention_mask.tolist()))
+        if input_features.shape[0] > 1:
+            return mx.zeros((5, 1))
+        return input_features[0].T[:int(audio_feature_lengths[0])]
+
+    per_clip = loader._encode_audio_clips_one_at_a_time(get_audio_features)
+    features = mx.array([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 0.0]]])
+    mask, lengths = mx.array([[1, 1, 1], [1, 1, 0]]), mx.array([3, 2])
+    assert per_clip(None, features, mask, lengths).tolist() == [[1.0], [2.0], [3.0], [4.0], [5.0]]
+    assert calls == [(1, [[1, 1, 1]]), (1, [[1, 1, 0]])]
+    assert per_clip(None, features[1:], mask[1:], lengths[1:]).tolist() == [[4.0], [5.0]]
+
+    Thinker = type("Thinker", (), {"get_audio_features": get_audio_features})
+
+    class Model:
+        __module__ = "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe"
+
+    package = "mlx_vlm.models.qwen3_omni_moe"
+    audio = types.SimpleNamespace(AudioModel=type("AudioModel", (), {"__call__": lambda self: None}))
+    monkeypatch.setitem(sys.modules, f"{package}.thinker", types.SimpleNamespace(Thinker=Thinker))
+    monkeypatch.setitem(sys.modules, f"{package}.audio", audio)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda name: Model if name == "qwen" else object)
+    source = {"text": "for i, length in enumerate(chunk_lens_after_cnn):"}
+    monkeypatch.setattr(loader, "_safe_getsource", lambda _: source["text"])
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")  # a fixed tower is left alone
+    assert Thinker.get_audio_features is get_audio_features
+    source["text"] = "for i, length in enumerate(feature_lens_after_cnn):"
+    loader._ensure_qwen3_omni_audio_per_clip("other")
+    assert Thinker.get_audio_features is get_audio_features
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")
+    repaired = Thinker.get_audio_features
+    assert repaired.__wrapped__ is get_audio_features
+    loader._ensure_qwen3_omni_audio_per_clip("qwen")
+    assert Thinker.get_audio_features is repaired
 
 
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
@@ -2338,6 +2394,105 @@ def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):
         "pytorch_model.bin",
     ):
         assert not (dst / skipped).exists()
+
+
+def test_copy_source_sidecars_refuses_symlinks_leaving_the_model(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("private", encoding="utf-8")
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "vocab.txt").write_text("vocab", encoding="utf-8")
+    (src / "leak.txt").symlink_to(secret)
+    (src / "inside.txt").symlink_to(src / "vocab.txt")
+
+    assert mutils._copy_source_sidecars(src, dst) == 2
+    assert not (dst / "leak.txt").exists()
+    assert (dst / "inside.txt").read_text(encoding="utf-8") == "vocab"
+
+
+def test_copy_source_sidecars_follows_hf_snapshot_blob_links(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    repo = tmp_path / "models--org--name"
+    blob = repo / "blobs" / "abc123"
+    blob.parent.mkdir(parents=True)
+    blob.write_text("template", encoding="utf-8")
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "chat_template.jinja").symlink_to(blob)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "chat_template.jinja").read_text(encoding="utf-8") == "template"
+
+
+def test_copy_source_sidecars_follows_shared_hf_blob_store(tmp_path):
+    # huggingface_hub >= 1.32: snapshot -> models--*/blobs/<etag> -> <cache>/blobs/<xx>/<hash>.
+    import unsloth_zoo.mlx.utils as mutils
+
+    shared = tmp_path / "blobs" / "91" / "91bf"
+    shared.parent.mkdir(parents=True)
+    shared.write_bytes(b"sentencepiece")
+    repo = tmp_path / "models--org--name"
+    (repo / "blobs").mkdir(parents=True)
+    (repo / "blobs" / "etag").symlink_to(shared)
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.model").symlink_to(repo / "blobs" / "etag")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "tokenizer.model").read_bytes() == b"sentencepiece"
+
+
+def test_a_config_symlink_out_of_the_model_is_not_recovered(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    secret = tmp_path / "docker_config.json"
+    secret.write_text('{"auths": {"x": "SECRET"}}')
+    src = tmp_path / "model"
+    src.mkdir()
+    (src / "config.json").symlink_to(secret)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(src),))
+    assert not (out / "config.json").exists()
+
+
+def test_a_config_override_dir_falls_back_to_the_snapshot_config(tmp_path):
+    # The VLM config override dir links unpatched files back to the snapshot.
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    repo = tmp_path / "models--org--name"
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (blobs / "deadbeef").write_text('{"model_type": "real"}')
+    (snapshot / "config.json").symlink_to(blobs / "deadbeef")
+    override = tmp_path / "unsloth_mlx_vlm_config_x"
+    override.mkdir()
+    (override / "config.json").symlink_to(snapshot / "config.json")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(override), str(snapshot)))
+    assert (out / "config.json").read_text() == '{"model_type": "real"}'
 
 
 def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
@@ -3421,7 +3576,10 @@ def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
     # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
     # a bare parent + os.sep would produce and never match.
     home = tmp_path / ".unsloth"
-    assert _trusted(monkeypatch, tmp_path / "anywhere", home, env_value=os.sep) is True
+    folder = tmp_path / "anywhere"
+    # Drive-qualified on Windows: a bare "\\" never contains C:\...
+    root = os.path.splitdrive(str(folder))[0] + os.sep
+    assert _trusted(monkeypatch, folder, home, env_value=root) is True
 
 
 def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):
@@ -4405,3 +4563,334 @@ def test_tokenizer_load_never_prompts_for_remote_code(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="custom code"):
         loader._load_mlx_tokenizer(tmp_path)
     assert not prompts, "tokenizer load prompted on stdin for remote code"
+
+
+def test_tokenizer_scope_forwards_trust_without_model_config_and_restores(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from transformers import AutoTokenizer, PretrainedConfig
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "RemoteTokenizer",
+        "auto_map": {"AutoTokenizer": ["tokenization_custom.RemoteTokenizer", None]},
+    }))
+    calls = []
+
+    def remote_tokenizer(path, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("trust_remote_code"):
+            raise ValueError("custom code requires trust_remote_code=True")
+        return "remote"
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(remote_tokenizer))
+    with loader._mlx_tokenizer_loading_scope(True):
+        assert AutoTokenizer.from_pretrained(tmp_path, trust_remote_code=False) == "remote"
+        assert isinstance(calls[-1]["config"], PretrainedConfig)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(AutoTokenizer.from_pretrained, tmp_path, trust_remote_code=True).result() == "remote"
+        assert "config" not in calls[-1]
+        with loader._mlx_tokenizer_loading_scope():
+            with pytest.raises(ValueError, match=r"tokenization_custom.py.*trust_remote_code=True"):
+                AutoTokenizer.from_pretrained(tmp_path, trust_remote_code=True)
+        assert AutoTokenizer.from_pretrained(tmp_path) == "remote"
+    assert AutoTokenizer.from_pretrained is remote_tokenizer
+    with pytest.raises(RuntimeError):
+        with loader._mlx_tokenizer_loading_scope():
+            raise RuntimeError("failed processor")
+    assert AutoTokenizer.from_pretrained is remote_tokenizer
+
+
+
+@pytest.mark.parametrize("failure_mode", ["processor", "tokenizer", "swallowed"])
+@pytest.mark.parametrize("native_available", [False, True])
+def test_processor_remote_refusal_names_file_and_trust_reaches_nested_tokenizer(
+    monkeypatch, tmp_path, failure_mode, native_available,
+):
+    from transformers import AutoTokenizer
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "custom_vlm",
+        "auto_map": {"AutoProcessor": "processing_custom.CustomProcessor"},
+    }))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "RemoteTokenizer",
+        "auto_map": {"AutoTokenizer": ["tokenization_custom.RemoteTokenizer", None]},
+    }))
+    calls = []
+
+    class RemoteProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            calls.append(kwargs["trust_remote_code"])
+            if not kwargs["trust_remote_code"]:
+                if failure_mode != "processor":
+                    try:
+                        AutoTokenizer.from_pretrained(path)
+                    except ValueError:
+                        if failure_mode == "swallowed":
+                            raise ValueError("Unrecognized processing class")
+                        raise
+                raise ValueError("contains custom code which must be executed; trust_remote_code=True")
+            return AutoTokenizer.from_pretrained(path)
+
+    def tokenizer(path, **kwargs):
+        if not kwargs["trust_remote_code"]:
+            raise ValueError("custom code requires trust_remote_code=True")
+        return "processor-tokenizer"
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(tokenizer))
+    monkeypatch.setitem(globals(), "AutoProcessor", RemoteProcessor)
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    monkeypatch.setattr(loader, "_ensure_vlm_detokenizer_copy", lambda: None)
+    native = object()
+    monkeypatch.setattr(
+        loader, "_load_declared_mlx_vlm_processor",
+        lambda *_a, **_k: native if native_available else None,
+    )
+    default = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    if native_available:
+        assert default(tmp_path) is native
+    else:
+        code_file = "processing_custom" if failure_mode == "processor" else "tokenization_custom"
+        with pytest.raises(ValueError, match=rf"{code_file}.py.*trust_remote_code=True"):
+            default(tmp_path)
+    trusted = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load, allow_remote_code=True)
+    assert trusted(tmp_path) == "processor-tokenizer"
+    assert calls == [False, True]
+
+
+
+@pytest.mark.parametrize("trust", [False, True])
+def test_mlx_lm_tokenizer_loader_forwards_trust(monkeypatch, tmp_path, trust):
+    from transformers import AutoTokenizer
+    import mlx_lm.utils as lm_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "tokenizer_config.json").write_text('{"tokenizer_class":"RemoteTokenizer"}')
+    calls = []
+
+    def tokenizer(path, **kwargs):
+        calls.append(kwargs)
+        return "tokenizer"
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(tokenizer))
+    monkeypatch.setattr(lm_utils, "_download", lambda *a, **k: tmp_path)
+    monkeypatch.setattr(lm_utils, "load_model", lambda *a, **k: ("model", {"eos_token_id": 7}))
+
+    def load_tokenizer(path, config, eos_token_ids):
+        assert eos_token_ids == 7
+        return AutoTokenizer.from_pretrained(path)
+
+    monkeypatch.setattr(lm_utils, "load_tokenizer", load_tokenizer)
+    result = loader._load_mlx_lm_with_strict_fallback(
+        tmp_path, "custom", None, {"tokenizer_config": {"trust_remote_code": trust}},
+    )
+    assert result == ("model", "tokenizer")
+    assert calls[0]["trust_remote_code"] is trust
+
+
+
+@pytest.mark.parametrize("trust", [False, True])
+def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
+    import transformers
+    import unsloth_zoo.mlx.loader as loader
+
+    processor, calls = object(), []
+
+    def record(path, **kwargs):
+        calls.append(kwargs["trust_remote_code"])
+        return processor
+
+    class FakeAutoImageProcessor:
+        from_pretrained = staticmethod(record)
+
+    # The real class is a gated placeholder when torchvision is absent.
+    monkeypatch.setattr(transformers, "AutoImageProcessor", FakeAutoImageProcessor)
+    assert loader._build_vlm_image_processor_from_config(
+        tmp_path, {}, {}, trust_remote_code=trust,
+    ) is processor
+    assert calls == [trust]
+
+
+@pytest.mark.parametrize("native_tokenizer", [False, True])
+def test_swallowed_processor_refusal_is_not_returned_as_a_half_processor(
+    monkeypatch, tmp_path, native_tokenizer,
+):
+    """A swallowed refusal returns successfully with the image-processor half."""
+    from transformers import AutoTokenizer
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "custom_vlm"}))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "RemoteTokenizer",
+        "auto_map": {"AutoTokenizer": ["tokenization_custom.RemoteTokenizer", None]},
+    }))
+
+    class ImageProcessorOnly:
+        tokenizer = None
+
+    class WithTokenizer:
+        tokenizer = object()
+
+    class SwallowingAutoProcessor:
+        """Mirrors mlx_vlm.models.base's `except Exception: pass` shim."""
+
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            try:
+                AutoTokenizer.from_pretrained(path)
+            except Exception:
+                pass
+            return WithTokenizer() if native_tokenizer else ImageProcessorOnly()
+
+    def tokenizer(path, **kwargs):
+        if not kwargs["trust_remote_code"]:
+            raise ValueError("custom code requires trust_remote_code=True")
+        return "remote"
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(tokenizer))
+    monkeypatch.setitem(globals(), "AutoProcessor", SwallowingAutoProcessor)
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    monkeypatch.setattr(loader, "_ensure_vlm_detokenizer_copy", lambda: None)
+
+    scoped = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    if native_tokenizer:
+        assert isinstance(scoped(tmp_path), WithTokenizer)
+    else:
+        with pytest.raises(
+            ValueError, match=r"tokenization_custom.py.*trust_remote_code=True",
+        ):
+            scoped(tmp_path)
+
+    trusted = loader._bind_mlx_vlm_processor_loader(
+        _test_bound_vlm_load, allow_remote_code=True,
+    )
+    assert trusted(tmp_path) is not None
+
+
+@pytest.mark.parametrize("optimized", [True, False])
+def test_complete_processor_runtime_uses_live_tokenizer(monkeypatch, optimized):
+    import unsloth_zoo.mlx.loader as loader
+
+    tok = types.SimpleNamespace(decode=lambda ids: "decoded")
+    processor = types.SimpleNamespace(tokenizer=tok, additional_eos_token_ids=[7])
+    detok_module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    utils_module = types.ModuleType("mlx_vlm.utils")
+
+    def native(tokenizer):
+        if not optimized:
+            raise AttributeError("vocab")
+        return types.SimpleNamespace(tokenizer=tokenizer, native=True)
+
+    detok_module.load_tokenizer = lambda *a, **k: native
+    detok_module.NaiveStreamingDetokenizer = lambda t: types.SimpleNamespace(tokenizer=t, native=False)
+    utils_module.StoppingCriteria = lambda eos, t, additional_eos_token_ids=(): (eos, t, additional_eos_token_ids)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", detok_module)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
+    assert loader._complete_mlx_vlm_processor_runtime(processor, "unused", [2, 4]) is processor
+    assert processor.detokenizer.tokenizer is tok
+    assert processor.detokenizer.native is optimized
+    assert tok.stopping_criteria == ([2, 4], tok, [7])
+    detok = processor.detokenizer
+    loader._complete_mlx_vlm_processor_runtime(processor, "unused", [9])
+    assert processor.detokenizer is detok
+    assert tok.stopping_criteria[0] == [2, 4]
+
+
+def test_processor_runtime_completes_older_stopping_criteria(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    utils_module = types.ModuleType("mlx_vlm.utils")
+    utils_module.StoppingCriteria = lambda eos, t: (eos, t)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
+    tokenizer = types.SimpleNamespace(eos_token_id=7, decode=lambda ids: "")
+    processor = types.SimpleNamespace(tokenizer=tokenizer, detokenizer=object())
+    loader._complete_mlx_vlm_processor_runtime(processor, "unused")
+    assert tokenizer.stopping_criteria == (7, tokenizer)
+
+
+def test_processor_runtime_failure_names_processor_and_cause(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    class BrokenProcessor:
+        def decode(self, ids):
+            return ""
+
+    module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    def broken(*args, **kwargs):
+        raise ValueError("decode is unavailable")
+    module.load_tokenizer = broken
+    module.NaiveStreamingDetokenizer = broken
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", module)
+    utils_module = types.ModuleType("mlx_vlm.utils")
+    utils_module.StoppingCriteria = object
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
+    with pytest.raises(ValueError, match="cannot initialize generation for BrokenProcessor.*decode is unavailable"):
+        loader._complete_mlx_vlm_processor_runtime(BrokenProcessor(), "unused")
+
+
+@pytest.mark.parametrize("same_tokenizer", [True, False])
+def test_processor_recovery_does_not_bind_runtime_to_replaced_tokenizer(same_tokenizer):
+    from unsloth_zoo.mlx.loader import _inherit_mlx_vlm_processor_runtime
+
+    old = types.SimpleNamespace(stopping_criteria=object())
+    source = types.SimpleNamespace(tokenizer=old, detokenizer=object(), chat_template="template")
+    target = types.SimpleNamespace(tokenizer=old if same_tokenizer else types.SimpleNamespace())
+    _inherit_mlx_vlm_processor_runtime(source, target)
+    assert target.chat_template == "template"
+    assert hasattr(target, "detokenizer") is same_tokenizer
+    assert hasattr(target.tokenizer, "stopping_criteria") is same_tokenizer
+
+
+@pytest.mark.parametrize("serializable", [True, False])
+def test_processor_save_serializes_components_or_names_source_fallback(tmp_path, capsys, serializable):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    (source / "processor_config.json").write_text('{"processor_class":"SourceProcessor"}')
+    class Component:
+        def to_dict(self):
+            return {"size": 32} if serializable else {"unserializable": object()}
+    class Processor:
+        def save_pretrained(self, path):
+            (Path(path) / "processor_config.json").write_text('{"truncated":')
+            raise TypeError("cannot serialize component")
+        def to_dict(self):
+            return {"processor_class": "Processor", "image_processor": Component()}
+    _save_vlm_processor_assets(Processor(), output, [source])
+    config = json.loads((output / "processor_config.json").read_text())
+    if serializable:
+        assert config == {"processor_class":"Processor", "image_processor":{"size":32}}
+    else:
+        assert config == {"processor_class":"SourceProcessor"}
+        assert "copied processor source assets: processor_config.json" in capsys.readouterr().out
+
+
+def test_processor_runtime_leaves_decodeless_processors_bare(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    def detokenizer(tokenizer):
+        return tokenizer.decode([0])
+    module.load_tokenizer = lambda *a, **k: detokenizer
+    module.NaiveStreamingDetokenizer = detokenizer
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", module)
+    processor = types.SimpleNamespace(image_processor=object())
+    assert loader._complete_mlx_vlm_processor_runtime(processor, "unused") is processor
+    assert not hasattr(processor, "detokenizer")
+
+
+def test_clean_processor_save_does_not_invent_processor_config(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    class Processor:
+        def save_pretrained(self, path):
+            (Path(path) / "preprocessor_config.json").write_text('{"size": 32}')
+        def to_dict(self):
+            return {"processor_class": "Processor"}
+    _save_vlm_processor_assets(Processor(), tmp_path)
+    assert (tmp_path / "preprocessor_config.json").is_file()
+    assert not (tmp_path / "processor_config.json").exists()
