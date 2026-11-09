@@ -32,6 +32,7 @@ __all__ = [
     "mxfp4_expert_grouped_mm",
     "mxfp4_grouped_matmul",
     "mxfp4_gemm_available",
+    "mxfp4_grouped_gemv_available",
     "mxfp4_matmul",
 ]
 
@@ -46,7 +47,7 @@ except Exception:
 if _HAS_TRITON:
 
     @triton.jit
-    def _decode_mxfp4_tile(packed, scale, ROWS: tl.constexpr, COLS: tl.constexpr):
+    def _decode_mxfp4_tile(packed, scale, ROWS: tl.constexpr, COLS: tl.constexpr):  # tile rows / decoded cols per row
         """e2m1 bits into bf16 give value * 2^-126 (0.5 on the subnormal 2^-127); 2^(scale - 1) restores it exactly."""
         x0 = ((packed & 0x07) << 6) | ((packed & 0x08) << 12)
         x1 = ((packed & 0x70) << 2) | ((packed & 0x80) << 8)
@@ -119,6 +120,69 @@ if _HAS_TRITON:
         return tl.reshape(tl.join(lo, hi), (R, CB * 2))
 
     @triton.jit
+    def _decode_mxfp4_tile_cvt(packed, scale):
+        """Hardware convert decode (PTX 9.2 ``cvt.rn.bf16x2.e2m1x2.scaled::n2::ue8m0``). Scale 255 is NaN to the
+        cvt but value * 2^128 in the reference, so it decodes at 254 and is doubled."""
+        R: tl.constexpr = packed.shape[0]
+        CB: tl.constexpr = packed.shape[1]
+        CG: tl.constexpr = scale.shape[1]
+        sc = tl.reshape(tl.broadcast_to(scale[:, :, None], (R, CG, 16)), (R, CB))
+        lo, hi = tl.inline_asm_elementwise(
+            asm = """
+            {
+            .reg .b32 s, t1, t2, t3, c0, c1, c2, c3, z, two;
+            .reg .b16 s2, h0, h1, h2, h3;
+            .reg .b8 q0, q1, q2, q3;
+            .reg .pred p;
+            and.b32 s, $5, 0xFF;
+            setp.eq.u32 p, s, 255;
+            min.u32 s, s, 254;
+            prmt.b32 s, s, 0, 0x0000;
+            cvt.u16.u32 s2, s;
+            shr.b32 t1, $4, 8;
+            shr.b32 t2, $4, 16;
+            shr.b32 t3, $4, 24;
+            cvt.u16.u32 h0, $4;
+            cvt.u16.u32 h1, t1;
+            cvt.u16.u32 h2, t2;
+            cvt.u16.u32 h3, t3;
+            cvt.u8.u16 q0, h0;
+            cvt.u8.u16 q1, h1;
+            cvt.u8.u16 q2, h2;
+            cvt.u8.u16 q3, h3;
+            cvt.rn.bf16x2.e2m1x2.scaled::n2::ue8m0 c0, q0, s2;
+            cvt.rn.bf16x2.e2m1x2.scaled::n2::ue8m0 c1, q1, s2;
+            cvt.rn.bf16x2.e2m1x2.scaled::n2::ue8m0 c2, q2, s2;
+            cvt.rn.bf16x2.e2m1x2.scaled::n2::ue8m0 c3, q3, s2;
+            prmt.b32 $0, c0, c1, 0x5410;
+            prmt.b32 $2, c0, c1, 0x7632;
+            prmt.b32 $1, c2, c3, 0x5410;
+            prmt.b32 $3, c2, c3, 0x7632;
+            mov.b32 z, 0x80008000;
+            mov.b32 two, 0x40004000;
+            @p fma.rn.bf16x2 $0, $0, two, z;
+            @p fma.rn.bf16x2 $1, $1, two, z;
+            @p fma.rn.bf16x2 $2, $2, two, z;
+            @p fma.rn.bf16x2 $3, $3, two, z;
+            }
+            """,
+            constraints = "=r,=r,=r,=r,r,r",
+            args = [packed, sc], dtype = (tl.bfloat16, tl.bfloat16), is_pure = True, pack = 4,
+        )
+        return tl.reshape(tl.join(lo, hi), (R, CB * 2))
+
+    @triton.jit
+    def _decode_probe_kernel(blocks_ptr, scales_ptr, out_ptr, CVT: tl.constexpr):  # hw e2m1 convert vs inline asm
+        r = tl.program_id(0) * 64 + tl.arange(0, 64)
+        packed = tl.load(blocks_ptr + r[:, None] * 16 + tl.arange(0, 16)[None, :])
+        scale = tl.load(scales_ptr + r[:, None] + tl.arange(0, 1)[None, :])
+        if CVT:
+            w = _decode_mxfp4_tile_cvt(packed, scale)
+        else:
+            w = _decode_mxfp4_tile_asm(packed, scale)
+        tl.store(out_ptr + r[:, None] * 32 + tl.arange(0, 32)[None, :], w)
+
+    @triton.jit
     def _mxfp4_scale_factors(scale):
         """e8m0 -> (2^(scale - 1) or 2^(scale - 128), 1 or 2^127) as bf16; their product restores value * 2^-126."""
         big = scale > 128
@@ -127,7 +191,7 @@ if _HAS_TRITON:
         return f1, f2
 
     @triton.jit
-    def _decode_mxfp4_halves(packed, scale, ROWS: tl.constexpr, BYTES: tl.constexpr):
+    def _decode_mxfp4_halves(packed, scale, ROWS: tl.constexpr, BYTES: tl.constexpr):  # tile rows / decoded values per nibble half
         """Low- and high-nibble bf16 tiles, not interleaved (caller pairs them with even / odd columns)."""
         lo = (((packed & 0x07) << 6) | ((packed & 0x08) << 12)).to(tl.uint16).to(tl.bfloat16, bitcast = True)
         hi = (((packed & 0x70) << 2) | ((packed & 0x80) << 8)).to(tl.uint16).to(tl.bfloat16, bitcast = True)
@@ -143,9 +207,9 @@ if _HAS_TRITON:
         x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr, bias_ptr,
         E, R, G, K, N, M,
         stride_xm, stride_om,
-        TRANS_B: tl.constexpr, E_POW2: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        SPLIT: tl.constexpr, GROUPED: tl.constexpr, HAS_BIAS: tl.constexpr, ASM: tl.constexpr,
+        TRANS_B: tl.constexpr, E_POW2: tl.constexpr,  # weight is [E, N, K] / num experts pow2
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # tile M rows / N cols / K reduction
+        SPLIT: tl.constexpr, GROUPED: tl.constexpr, HAS_BIAS: tl.constexpr, ASM: tl.constexpr,  # even/odd nibble split / routed rows / bias / decode mode 0-2
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -205,7 +269,9 @@ if _HAS_TRITON:
                         scales_ptr + prow[:, None] * G + offs_kg[None, :],
                         mask = mask_n[:, None] & (offs_kg[None, :] < G), other = 127,
                     )
-                    if ASM:
+                    if ASM == 2:
+                        w = _decode_mxfp4_tile_cvt(packed, scale)
+                    elif ASM:
                         w = _decode_mxfp4_tile_asm(packed, scale)
                     else:
                         w = _decode_mxfp4_tile(packed.to(tl.int32), scale.to(tl.int32), BLOCK_N, BLOCK_K)
@@ -253,6 +319,7 @@ if _HAS_TRITON:
                         mask = mask_k[:, None] & (offs_ng[None, :] < G), other = 127,
                     )
                     if ASM:
+                        # The convert decode is slower here on sm_120 (dX tile, 256 rows: +2 to 6%): fma decode.
                         w = _decode_mxfp4_tile_asm(packed, scale)
                     else:
                         w = _decode_mxfp4_tile(packed.to(tl.int32), scale.to(tl.int32), BLOCK_K, BLOCK_N)
@@ -269,7 +336,7 @@ if _HAS_TRITON:
     def _mxfp4_grouped_gemv_kernel(
         x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr,
         E, R, G, stride_xm, stride_om,
-        E_POW2: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ASM: tl.constexpr,
+        E_POW2: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ASM: tl.constexpr,  # num experts pow2 / tile N / tile K / decode mode
     ):
         # out[m] = x[m] @ P[e(m)]^T, one routed row per program: near one row per expert the MMA tiles are latency bound.
         m = tl.program_id(0)
@@ -295,7 +362,9 @@ if _HAS_TRITON:
                 scales_ptr + prow[:, None] * G + offs_kg[None, :],
                 mask = mask_n[:, None] & (offs_kg[None, :] < G), other = 127,
             )
-            if ASM:
+            if ASM == 2:
+                w = _decode_mxfp4_tile_cvt(packed, scale)
+            elif ASM:
                 w = _decode_mxfp4_tile_asm(packed, scale)
             else:
                 w = _decode_mxfp4_tile(packed.to(tl.int32), scale.to(tl.int32), BLOCK_N, BLOCK_K)
@@ -303,7 +372,7 @@ if _HAS_TRITON:
         tl.store(out_ptr + m * stride_om + offs_n, acc.to(out_ptr.dtype.element_ty), mask = mask_n)
 
     @triton.jit
-    def _decode_only_kernel(blocks_ptr, scales_ptr, out_ptr, RG, ROWS: tl.constexpr, COLS: tl.constexpr):
+    def _decode_only_kernel(blocks_ptr, scales_ptr, out_ptr, RG, ROWS: tl.constexpr, COLS: tl.constexpr):  # tile rows / decoded cols per program
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
         cols_b = tl.program_id(1) * (COLS // 2) + tl.arange(0, COLS // 2)
@@ -396,18 +465,69 @@ def _big_tiles(device):
 _ASM_OK = {}
 
 
-def _asm_ok(device):
-    """Inline-PTX bf16x2 fma decode (Kimi-K3 port): sm_80+ CUDA; UNSLOTH_MXFP4_ASM=0 turns it off."""
-    ok = _ASM_OK.get(device.index)
+def _asm_ok(device, eager = False):
+    """Decode mode (the kernels' ASM constexpr): 0 plain Triton, 1 inline-PTX bf16x2 fma decode (Kimi-K3 port, sm_80+
+    CUDA; UNSLOTH_MXFP4_ASM=0 turns it off), 2 the hardware e2m1 convert where ``_cvt_ok`` passes."""
+    # May be a plain index: Dynamo cannot trace ``torch.device.__new__`` (hit on T4).
+    key = device if device is None or isinstance(device, int) else device.index
+    ok = _ASM_OK.get(key)
     if ok is None:
         import os
-        index = device.index if device.index is not None else torch.cuda.current_device()
-        ok = _ASM_OK[device.index] = (
+        index = key if key is not None else torch.cuda.current_device()
+        ok = (
             torch.version.hip is None
             and torch.cuda.get_device_capability(index) >= (8, 0)
             and os.environ.get("UNSLOTH_MXFP4_ASM", "1") != "0"
         )
+        if ok:
+            cvt = _cvt_ok(index, eager)
+            if cvt is None:
+                return True  # traced before any eager call: decide (and cache) on the next eager launch
+            ok = 2 if cvt else True
+        _ASM_OK[key] = ok
     return ok
+
+
+def _cvt_ok(index, eager = False):
+    """Needs PTX 9.2 ptxas and sm_100f / sm_120f; checked bit for bit vs the fma decode once. sm_100 is untimed,
+    so auto only enables sm_120. None = cannot probe here (inside a trace or a CUDA graph capture)."""
+    import os
+    mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
+    if torch.version.hip is not None:
+        return False  # inline PTX; ROCm reports gfx11 as capability 11.x
+    major = torch.cuda.get_device_capability(index)[0]
+    if mode == "0" or major < 10 or (mode != "1" and major != 12):
+        return False
+    if not eager:
+        try:
+            if torch.compiler.is_compiling():
+                return None
+            from torch._guards import detect_fake_mode
+            if detect_fake_mode() is not None:
+                return None
+        except Exception:
+            pass
+    try:
+        # Probe syncs: a capture on the current stream or on the operand's device would be invalidated.
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        with torch.cuda.device(index):
+            if torch.cuda.is_current_stream_capturing():
+                return None
+    except Exception:
+        return None
+    try:
+        device = torch.device("cuda", index)
+        rows = torch.arange(65536, device = device)
+        blocks = (rows % 256).to(torch.uint8)[:, None].expand(65536, 16).contiguous()
+        scales = (rows // 256).to(torch.uint8)
+        got, want = (torch.empty(65536, 32, dtype = torch.bfloat16, device = device) for _ in range(2))
+        with torch.cuda.device(device):
+            _decode_probe_kernel[(1024,)](blocks, scales, got, CVT = True, enable_fp_fusion = True)
+            _decode_probe_kernel[(1024,)](blocks, scales, want, CVT = False, enable_fp_fusion = True)
+        return bool(torch.equal(got.view(torch.int16), want.view(torch.int16)))
+    except Exception:
+        return False
 
 
 def _gemv_rows(M, E, transpose_b):
@@ -509,9 +629,42 @@ if _HAS_TRITON:
         mxfp4_grouped_mm_op = mxfp4_grouped_gemv_op = None
 
 
+_assume_constant_result = getattr(torch.compiler, "assume_constant_result", None) or \
+    getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
+
+
+@_assume_constant_result
+def _resolve_decode_mode(index):
+    # Dynamo runs this eagerly on real tensors at trace time, so a cold compiled region bakes in the probed mode, not
+    # the fma fallback the op body (traced on FakeTensors) would see; pass the index so a traced call never builds a
+    # torch.device.
+    return _asm_ok(index, eager = True)
+
+
+def _never_a_root_frame(fn):
+    """Never compile ``fn`` as its own frame. When the caller is skipped (sm_75 BF16 SkipFrame), its int arg turns
+    symbolic under ``dynamic=True`` and ``fullgraph`` raises."""
+    try:
+        from torch._dynamo.eval_frame import set_code_exec_strategy
+        from torch._dynamo.types import FrameAction, FrameExecStrategy
+        set_code_exec_strategy(fn.__code__, FrameExecStrategy(FrameAction.SKIP, FrameAction.SKIP))
+    except Exception:
+        try:
+            from torch._dynamo.eval_frame import skip_code
+            skip_code(fn.__code__)
+        except Exception:
+            pass
+    return fn
+
+
+_never_a_root_frame(_resolve_decode_mode)
+
+
 def mxfp4_grouped_mm_compiled(x, blocks, scales, counts, transpose_b):
     """``mxfp4_grouped_mm_op`` for compiled regions. The GEMV / tile choice is made here, where dynamo guards on the
     row count; inside the op the trace-time shape would freeze it for every later size."""
+    if x.is_cuda and torch.version.hip is None:
+        _resolve_decode_mode(x.device.index)
     if mxfp4_grouped_gemv_op is not None and _gemv_rows(x.shape[0], blocks.shape[0], transpose_b):
         return mxfp4_grouped_gemv_op(x, blocks, scales, counts)
     return mxfp4_grouped_mm_op(x, blocks, scales, counts, transpose_b)
@@ -653,16 +806,77 @@ def _probe_dense(device, dtype):
     return True
 
 
+# Answers reached inside a trace: read only by the next eager call (see mxfp4_dequant._TRACE_VERIFIED).
+_TRACE_AVAILABLE = {}
+
+
+def _available_in_trace(name, dtype, tiles, mode):
+    """``_available``'s answer without touching the caches a traced frame reads."""
+    key = (name, dtype) + (("tiles",) if tiles and mode != "1" else ())
+    try:
+        device = torch.device(name) if name is not None else torch.device("cuda", torch.cuda.current_device())
+        ok = mxfp4_grouped_mm_available(device)
+        if ok:
+            with torch.autocast(device.type, enabled = False), torch.no_grad():
+                ok = _probe_dense(device, dtype)
+        if ok and len(key) == 3:
+            ok = torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+    except Exception:
+        ok = False  # the eager call repeats the check and warns
+    _TRACE_AVAILABLE[key] = ok
+    return ok
+
+
+def _make_available_outside_trace():
+    from unsloth_zoo.mxfp4_dequant import _outside_trace
+    return _outside_trace(_available_in_trace)
+
+
+_available_outside_trace = _make_available_outside_trace()
+
+
 def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
-    """Self-checked once per (device, dtype), bf16 / fp16; ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
+    """Self-checked once per (device, dtype), bf16 / fp16, sm_80+ (``UNSLOTH_MXFP4_FUSED_GEMM=1`` also below);
+    ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
+    return _available(device, dtype, True)
+
+
+def mxfp4_grouped_gemv_available(device = None, dtype = torch.bfloat16) -> bool:
+    """``mxfp4_gemm_available`` without the arch floor: decode rows (``_gemv_rows``) run the GEMV on any GPU."""
+    return _available(device, dtype, False)
+
+
+def _available(device, dtype, tiles):
     if dtype not in (torch.bfloat16, torch.float16):
         return False
     import os
-    if os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto") in ("0", "dequant"):
+    mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
+    if mode in ("0", "dequant"):
         return False
-    key = (None if device is None else str(device), dtype)
+    # Keyed by the resolved GPU, so an unindexed device cannot reuse another GPU's answer.
+    name = None if device is None else str(device)
+    if name in (None, "cuda") and torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+        name = str(device)
+    key = (name, dtype)
+    if tiles and mode != "1":
+        # Below sm_80 (T4) the tile kernel loses to dequantize + cuBLAS; the grouped GEMV does not.
+        key += ("tiles",)
     ok = _AVAILABLE_DTYPE.get(key)
     if ok is not None:
+        return ok
+    from unsloth_zoo.mxfp4_dequant import _tracing
+    if _tracing():
+        # The self-check is data dependent (torch.allclose): run it outside the trace, the graph gets the verdict.
+        return _available_outside_trace(name, dtype, tiles, mode)
+    if _TRACE_AVAILABLE.get(key) is True:
+        _AVAILABLE_DTYPE[key] = True
+        return True
+    if len(key) == 3:
+        ok = _available(device, dtype, False) and (
+            torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+        )
+        _AVAILABLE_DTYPE[key] = ok
         return ok
     ok = mxfp4_grouped_mm_available(device)
     if ok:

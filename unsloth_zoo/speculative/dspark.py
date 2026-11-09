@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DSpark drafters for Qwen3 targets (DeepSpec `Qwen3DSparkModel` schema).
-
-Contract (unslothai/llama.cpp `src/models/dflash.cpp`, `common/speculative.cpp` draft-dspark,
-`conversion/qwen.py` DSparkModel, sample_from_anchor = true for this schema):
-- context = concat of target decoder-layer outputs `target_layer_ids` (pre final norm), each
-  position p injected as K/V of `hidden_norm(fc(context))` at position p;
-- a block at anchor a holds [x_a, mask, ..., mask] at positions a..a+B-1, attends non-causally to
-  itself and to context positions < a; slot j predicts x[a+j+1];
-- logits = lm_head(norm(h)) + markov_w2(markov_w1(prev)), prev = x_a for slot 0, then the previous
-  slot's token (teacher forced in training, greedy argmax in llama.cpp);
-- confidence = sigmoid(proj([norm(h); markov_w1(prev)])), trained against 1 - TV(target, draft).
-"""
+"""DSpark drafters for Qwen3 targets (DeepSpec schema); context is pre-final-norm target layer outputs; a block at
+anchor a attends non-causally to itself and context positions < a; slot j predicts x[a+j+1]; logits add
+markov_w2(markov_w1(prev)); confidence is trained against 1 - TV."""
 
 __all__ = [
     "Qwen3DSparkDrafter",
@@ -46,7 +37,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import Trainer, TrainingArguments
 
 from . import losses
-from .capture import resolve_text_parts, run_frozen_target
+from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
 
 _CONFIG_EXTRAS = (
     "block_size", "target_layer_ids", "mask_token_id", "num_anchors", "enable_confidence_head",
@@ -65,8 +56,7 @@ class _Rotary(nn.Module):
             raise NotImplementedError(f"Unsloth: DSpark drafter supports default RoPE, got {rope_type!r}.")
         theta = float(rope.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        # A plain attribute, not a buffer: `.to(bfloat16)` on the drafter must not round the
-        # frequencies (bf16 inv_freq drifts badly at long positions).
+        # A plain attribute, not a buffer: .to(bfloat16) on the drafter must not round the frequencies (bf16 inv_freq drifts badly at long positions).
         self.inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype = torch.int64).float() / dim))
 
     @torch.no_grad()
@@ -147,10 +137,7 @@ class _ConfidenceHead(nn.Module):
 
 
 def sample_anchor_positions(loss_mask, num_anchors, generator = None):
-    """DeepSpec anchor sampler: anchors a with loss_mask[a] and loss_mask[a+1], sorted, padded.
-
-    Returns (anchors [B, N] long, keep [B, N] bool); padded slots point at 0 with keep False.
-    """
+    """Sorted anchors a with loss_mask[a] and loss_mask[a+1]; returns (anchors [B, N] long, keep [B, N] bool); padded slots point at 0 with keep False."""
     B, S = loss_mask.shape
     device = loss_mask.device
     n_cand = max(S - 1, 0)
@@ -255,7 +242,7 @@ class Qwen3DSparkDrafter(nn.Module):
         drafter.apply(drafter._init_weights)
         with torch.no_grad():
             drafter.embed_tokens.weight.copy_(parts["embed_tokens"].weight.detach().float())
-            drafter.lm_head.weight.copy_(parts["lm_head"].weight.detach().float())
+            drafter.lm_head.weight.copy_(effective_lm_head_weight(parts["lm_head"]).detach().float())
         return drafter.to(device = device or parts["embed_tokens"].weight.device, dtype = dtype)
 
     def _init_weights(self, module):
@@ -312,16 +299,20 @@ class Qwen3DSparkDrafter(nn.Module):
         ctx = ctx & keep[:, q_block][..., None]
         return torch.cat([ctx, own], dim = -1)[:, None]
 
-    def forward(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
-        # Wrappers such as DDP only sync gradients for calls that go through forward().
-        return self.forward_train(context, input_ids, loss_mask, num_anchors, generator, anchors)
+    def forward(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None,
+                *, loss_kwargs = None):
+        out = self.forward_train(context, input_ids, loss_mask, num_anchors, generator, anchors)
+        if loss_kwargs is not None:
+            # Include the Markov/confidence heads in DDP's unused-parameter search.
+            teacher_hidden = loss_kwargs.get("teacher_hidden")
+            if teacher_hidden is not None:
+                loss_kwargs = dict(loss_kwargs, teacher_hidden = teacher_hidden.to(out["hidden"].device))
+            return dspark_loss(self, out, **loss_kwargs)
+        return out
 
     def forward_train(self, context, input_ids, loss_mask, num_anchors = None, generator = None, anchors = None):
-        """Teacher-forced DeepSpec training forward over sampled anchor blocks.
-
-        Returns hidden (normed draft states [B, N, bs, H]), target_ids, prev_ids, eval_mask,
-        label_index (position of each label), keep.
-        """
+        """Teacher-forced DSpark forward over sampled anchor blocks; returns normed hidden [B, N, bs, H], target_ids,
+        prev_ids, eval_mask, label_index (position of each label), keep."""
         B, S = input_ids.shape
         bs = self.block_size
         if anchors is None:
@@ -370,27 +361,26 @@ class Qwen3DSparkDrafter(nn.Module):
         return self.confidence_head(feats).float()
 
 
-def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher, labels):
+def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher_hidden, teacher_w, labels):
     logits = (hidden @ lm_w.T).float()
     if prev_emb is not None:
         logits = logits + (prev_emb @ mk_w2.T).float()
     logp = logits.log_softmax(-1)
     ce = -logp.gather(-1, labels[:, None]).squeeze(-1)
     correct = (logits.argmax(-1) == labels).float()
-    if teacher is None:
+    if teacher_hidden is None:
         return ce, torch.zeros_like(ce), correct
+    # Inside the checkpoint so each chunk's [rows, V] teacher probs are not kept until backward.
+    with torch.no_grad():
+        teacher = (teacher_hidden @ teacher_w.T).float().softmax(-1)
     l1 = (logp.exp() - teacher).abs().sum(-1)
     return ce, l1, correct
 
 
 def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 0.9,
                 confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None):
-    """DeepSpec DSpark loss, chunked over supervised rows so [rows, vocab] logits never coexist.
-
-    teacher_hidden: target post-norm states [B, S, H]; slot j's teacher is the target's own
-    prediction at label_index - 1, projected with `teacher_lm_head_weight` (the target's lm_head;
-    defaults to the drafter's copy). Returns (loss, stats).
-    """
+    """Chunked DSpark loss over supervised rows; teacher_hidden [B, S, H] is post-norm target states projected by
+    teacher_lm_head_weight (defaults to the drafter's copy); returns (loss, stats)."""
     eval_mask = out["eval_mask"]
     rows = eval_mask.nonzero(as_tuple = True)
     hidden = out["hidden"][rows]
@@ -414,11 +404,8 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
     ce_all, l1_all, correct_all = [], [], []
     for s in range(0, hidden.shape[0], chunk_size):
         e = slice(s, s + chunk_size)
-        teacher = None
-        if teacher_rows is not None:
-            with torch.no_grad():
-                teacher = (teacher_rows[e] @ teacher_w.T).float().softmax(-1)
-        args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight, teacher, labels[e])
+        args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight,
+                None if teacher_rows is None else teacher_rows[e], None if teacher_rows is None else teacher_w, labels[e])
         if torch.is_grad_enabled() and hidden.requires_grad:
             ce, l1, correct = checkpoint(_row_terms, *args, use_reentrant = False)
         else:
@@ -466,10 +453,7 @@ class DSparkTrainingArguments(TrainingArguments):
 
 
 class UnslothDSparkTrainer(Trainer):
-    """Trains a DSpark drafter (`model`) against a frozen target, one target pass per batch.
-
-    Rows need `input_ids` and optionally `labels` (-100 = not supervised, e.g. the prompt).
-    """
+    """Trains a DSpark drafter against a frozen target, one target pass per batch; rows need input_ids and optional labels (-100 = not supervised, e.g. the prompt)."""
 
     def __init__(self, model = None, args = None, target_model = None, **kwargs):
         if target_model is None:
@@ -482,6 +466,7 @@ class UnslothDSparkTrainer(Trainer):
         for p in target_model.parameters():
             p.requires_grad_(False)
         target_model.eval()
+        effective_lm_head_weight(resolve_text_parts(target_model)["lm_head"])  # unsupported adapted heads fail here
         model.freeze_shared()
         if kwargs.get("data_collator") is None:
             from .trainer import MTPDataCollator
@@ -510,14 +495,20 @@ class UnslothDSparkTrainer(Trainer):
                                      layer_ids = [i for i in ids if i >= 0], embed = -1 in ids)
         if -1 in ids:
             captured[-1] = captured.pop("embed")
-        dtype = next(p for p in drafter.parameters()).dtype
-        out = model(drafter.context_states(captured).to(dtype), input_ids, loss_mask, self.args.dspark_num_anchors)
-        loss, stats = dspark_loss(
-            drafter, out, teacher_hidden = captured["final"].to(device = out["hidden"].device, dtype = dtype), ce_alpha = self.args.dspark_ce_alpha,
+        param = next(p for p in drafter.parameters())
+        context = drafter.context_states(captured).to(param.dtype)
+        loss_kwargs = dict(
+            teacher_hidden = captured["final"].to(device = param.device, dtype = param.dtype), ce_alpha = self.args.dspark_ce_alpha,
             l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
             decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
-            teacher_lm_head_weight = resolve_text_parts(self.target_model)["lm_head"].weight,
+            teacher_lm_head_weight = effective_lm_head_weight(resolve_text_parts(self.target_model)["lm_head"]),
         )
+        if isinstance(model, nn.DataParallel):
+            # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
+            out = model(context, input_ids, loss_mask, self.args.dspark_num_anchors)
+            loss, stats = dspark_loss(drafter, out, **loss_kwargs)
+        else:
+            loss, stats = model(context, input_ids, loss_mask, self.args.dspark_num_anchors, loss_kwargs = loss_kwargs)
         if model.training:
             self._dspark_log.append(stats)
         return (loss, None) if return_outputs else loss

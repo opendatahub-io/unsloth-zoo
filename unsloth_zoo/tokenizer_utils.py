@@ -17,11 +17,10 @@
 try:
     import torch
 except ImportError:
-    # MLX (Apple Silicon) is torch-free. Only the embedding-fix helpers below use
-    # torch and they are never called on MLX, so keep the module importable so the
-    # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
+    # MLX is torch-free: keep torch optional so patch_tokenizer and get_chat_template work there.
     torch = None
 import copy
+import contextlib
 import copyreg
 import functools
 import gc
@@ -32,6 +31,7 @@ import datasets
 import re
 
 from .log import logger
+from ._gc_passes import collect_garbage
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -61,35 +61,112 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    embedding_matrix = model.get_input_embeddings ().weight.clone()
-    lm_head_matrix   = model.get_output_embeddings().weight.clone()
+    # Read-only: no vocab x hidden clones.
+    embedding_matrix = model.get_input_embeddings ().weight
+    lm_head_matrix   = model.get_output_embeddings().weight
 
-    # Get untrained tokens
     indicator_untrained = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
         (torch.amin(embedding_matrix, axis = 1) >= -eps)
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
-    # if n_untrained != 0:
-    #     print(
-    #         f"Unsloth: Not an error, but your model has {n_untrained} untrained tokens.\n"\
-    #         "We shall set them to the mean of the other trained tokens."
-    #     )
-    # pass
 
-    # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    # Remove bad tokens
     sum_embedding -= torch.sum(embedding_matrix[where_untrained], dtype = torch.float32, axis = 0)
     sum_lm_head   -= torch.sum(lm_head_matrix  [where_untrained], dtype = torch.float32, axis = 0)
 
-    # Find correct average by dividing by sum of trained tokens
     mean_embedding = (sum_embedding / n_trained)
     mean_lm_head   = (sum_lm_head   / n_trained)
 
     return mean_embedding, mean_lm_head
+pass
+
+
+def _vocab_pad_multiple(pad_to_multiple_of = None):
+    """Opt-in row alignment for grown embeddings: kwarg, else UNSLOTH_VOCAB_PAD_MULTIPLE, else off (None)."""
+    if pad_to_multiple_of is None:
+        import os
+        env = os.environ.get("UNSLOTH_VOCAB_PAD_MULTIPLE", "").strip()
+        if not env: return None
+        try: pad_to_multiple_of = int(env)
+        except ValueError:
+            logger.warning(f"Unsloth: ignoring UNSLOTH_VOCAB_PAD_MULTIPLE={env!r} (not an integer).")
+            return None
+    elif type(pad_to_multiple_of) is not int:
+        raise ValueError(f"Unsloth: pad_to_multiple_of must be an integer, got {pad_to_multiple_of!r}")
+    return pad_to_multiple_of if pad_to_multiple_of > 1 else None
+pass
+
+
+def _round_up_vocab(n_rows, pad_to_multiple_of):
+    if not pad_to_multiple_of: return n_rows
+    return -(-n_rows // pad_to_multiple_of) * pad_to_multiple_of
+pass
+
+
+# On text config to survive save/load and reach vLLM: every pad row (vLLM biases these) and the subset Unsloth put in
+# suppress_tokens; only that subset is released when a row becomes a token
+_VOCAB_PAD_IDS_KEY = "unsloth_vocab_pad_ids"
+_VOCAB_PAD_SUPPRESSED_KEY = "unsloth_vocab_pad_suppressed_ids"
+
+
+def _vocab_pad_config(model):
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    return get_text_config() if callable(get_text_config) else config
+pass
+
+
+def _set_or_drop(config, key, ids):
+    if ids:
+        setattr(config, key, ids)
+    elif hasattr(config, key):
+        delattr(config, key)
+pass
+
+
+def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = None):
+    """Alignment rows [start, end) have no token: keep HF generate from ever sampling them.
+    Ids in `now_valid` were alignment rows of an earlier call and are real tokens now; only
+    rows suppressed here are released, suppression the model or caller set is kept."""
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None: return
+    config = _vocab_pad_config(model)
+    rows = list(getattr(config, _VOCAB_PAD_IDS_KEY, None) or []) if config is not None else []
+    owned = getattr(config, _VOCAB_PAD_SUPPRESSED_KEY, None) if config is not None else None
+    owned = list(owned) if owned is not None else list(rows)
+    suppress = getattr(generation_config, "suppress_tokens", None) or []
+    if suppress and not rows and len(now_valid) and config is not None and not hasattr(config, _VOCAB_PAD_IDS_KEY):
+        # Legacy unrecorded rows are every row past the tokenizer, all suppressed; bound by pre-resize count.
+        if old_rows is None:
+            embeddings = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+            old_rows = getattr(getattr(embeddings, "weight", None), "shape", (0,))[0]
+        legacy = range(now_valid.start, old_rows)
+        if len(legacy) and set(legacy).issubset(suppress):
+            rows = list(legacy)
+            owned = list(legacy)
+    pass
+    if not rows and end <= start: return
+    suppress = list(suppress)
+    now_valid = set(now_valid)
+    suppress = [i for i in suppress if not (i in now_valid and i in owned)]
+    rows  = [i for i in rows  if i not in now_valid]
+    owned = [i for i in owned if i not in now_valid]
+    for i in range(start, end):
+        if i not in rows: rows.append(i)
+        if i not in suppress:
+            suppress.append(i)
+            owned.append(i)
+    pass
+    generation_config.suppress_tokens = suppress or None
+    if config is not None:
+        _set_or_drop(config, _VOCAB_PAD_IDS_KEY, rows)
+        # Keep an empty ownership list beside remaining rows: dropping it would read as every row is ours.
+        if rows: setattr(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+        else: _set_or_drop(config, _VOCAB_PAD_SUPPRESSED_KEY, owned)
+    pass
 pass
 
 
@@ -99,10 +176,19 @@ def add_new_tokens(
     new_tokens = [],
     method = "mean",
     interpolation = 0.5,
+    pad_to_multiple_of = None,
 ):
     """
     Resize the tokenizer and add new tokens to the model, excluding untrained
     tokens from the mean calculation.
+
+    pad_to_multiple_of (or UNSLOTH_VOCAB_PAD_MULTIPLE) is opt-in: when the
+    embedding has to grow, round its row count up to that multiple (e.g. 64).
+    The tokenizer length is unchanged; the extra rows hold the trained mean,
+    are never labels, and are added to generation_config.suppress_tokens so HF
+    generate cannot emit them. They are also recorded as config.unsloth_vocab_pad_ids,
+    which load_vllm reads to bias them out of vLLM sampling (vLLM ignores
+    suppress_tokens). config.vocab_size becomes the padded row count.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(isinstance(new_tokens, (list, tuple)))
@@ -124,16 +210,15 @@ def add_new_tokens(
         )
         new_tokens = [x for x in new_tokens if x not in overlapping_tokens]
     pass
+    # add_tokens dedupes; a repeat here would shift every later interpolation row.
+    new_tokens = list(dict.fromkeys(new_tokens))
 
-    # Get mean of trained tokens
-    # mean_embedding, mean_lm_head = fix_untrained_tokens(model)
 
     # Weirdly be careful reserved tokens can pop out
     mean_embedding, mean_lm_head = mean_of_trained_tokens(model)
     mean_embedding = mean_embedding.to(torch.float32)
     mean_lm_head   = mean_lm_head  .to(torch.float32)
 
-    # Get old lengths
     old_input_embedding  = model.get_input_embeddings ().weight
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
@@ -151,30 +236,27 @@ def add_new_tokens(
             tokenizer(token, add_special_tokens = False).input_ids for token in new_tokens
         ]
 
-    # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
     new_vocab_length = len(tokenizer)
-    # Some models ship an embedding that is padded LARGER than the tokenizer
-    # vocab (e.g. Gemma3: 262208 embedding rows vs 262145 tokens). Resizing to
-    # new_vocab_length would then SHRINK the matrix and silently destroy the
-    # already-trained rows past the tokenizer length. Never resize below the
-    # existing embedding: grow only when the new tokens overflow the padding.
-    # new_vocab_length already includes the freshly added tokens, so do NOT add
-    # their count again here.
+    # Embedding may be padded past the tokenizer vocab (Gemma3: 262208 rows vs 262145 tokens); never shrink it, grow
+    # only on overflow; new_vocab_length already includes the new tokens, so do not add their count again
     resize_target = max(old_input_length, old_output_length, new_vocab_length)
+    # Align only when the new tokens overflow the existing rows.
+    pad_to_multiple_of = _vocab_pad_multiple(pad_to_multiple_of)
+    old_rows = max(old_input_length, old_output_length)
+    if pad_to_multiple_of is not None and resize_target > old_rows:
+        resize_target = _round_up_vocab(resize_target, pad_to_multiple_of)
+    pass
     # Also resizes lm_head as well!
     model.resize_token_embeddings(resize_target)
 
-    # If we use interpolation, we interpolate between the mean embeddings and
-    # the Word2Vec sum of the other vectors
+    # With method interpolation, new rows blend the mean embedding with the Word2Vec sum of the other vectors.
     embedding_matrix = model.get_input_embeddings ().weight
     lm_head_matrix   = model.get_output_embeddings().weight
 
-    # Confirm sizes are correct. Compare against resize_target (not
-    # new_vocab_length): for padded embeddings the matrices keep their larger
-    # row count. The old check compared against new_vocab_length, so on a padded
-    # model it either never fired (masking the silent shrink) or fired spuriously.
+    # Compare sizes against resize_target, not new_vocab_length: padded matrices keep their larger row count; the old
+    # check either never fired (masking the silent shrink) or fired spuriously on padded models
     if embedding_matrix.shape[0] != resize_target:
         raise RuntimeError(
             "Unsloth: Embedding matrix size did not get resized properly. Please file a bug report!"
@@ -202,23 +284,32 @@ def add_new_tokens(
                 mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
                 mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
-            # Interpolate
             mean_embedding_token = mean_embedding*(1-interpolation) + mean_embedding_token*interpolation
             mean_lm_head_token   = mean_lm_head  *(1-interpolation) + mean_lm_head_token  *interpolation
 
-            # Set the new vector
             with torch.no_grad():
                 embedding_matrix[old_length+j] = mean_embedding_token
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
-        pass
     else:
-        # Now set the new tokens to the mean! Only touch the genuinely-new rows
-        # [old_length:new_vocab_length]; on a padded embedding the rows past
-        # new_vocab_length are the model's original alignment padding and must be
-        # left as shipped (the old [old_length:] slice overwrote those too).
+        # Set only the new rows [old_length:new_vocab_length] to the mean; rows past new_vocab_length are the model's
+        # alignment padding and must stay as shipped (the old [old_length:] slice overwrote them too)
         with torch.no_grad():
             embedding_matrix[old_length:new_vocab_length] = mean_embedding
             lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
+    pass
+
+    # Deterministic mean init for alignment rows (HF mean_resizing samples them randomly).
+    pad_start = max(old_rows, new_vocab_length)
+    padded = pad_to_multiple_of is not None and resize_target > pad_start
+    if padded:
+        with torch.no_grad():
+            embedding_matrix[pad_start:resize_target] = mean_embedding
+            lm_head_matrix  [pad_start:resize_target] = mean_lm_head
+    # A later call reuses earlier alignment rows for its new tokens: those ids must not stay suppressed.
+    _suppress_padded_rows(
+        model, pad_start, resize_target if padded else pad_start, range(old_length, new_vocab_length),
+        old_rows = old_rows,
+    )
     pass
 
     # We set a flag to say we need to train embeddings
@@ -229,10 +320,8 @@ def add_new_tokens(
     pass
     internal_model._need_to_train_embeddings = True
 
-    # Fix up all vocab sizes. Use resize_target, not len(tokenizer): config
-    # vocab_size must equal the actual embedding / lm_head row count or the model
-    # cannot round-trip through save_pretrained/from_pretrained (state_dict shape
-    # mismatch). For a padded embedding these differ.
+    # Config vocab_size must match the embedding and lm_head row count, so use resize_target not len(tokenizer) (they
+    # differ when padded) or save_pretrained/from_pretrained hits a shape mismatch
     current_model = model
     while hasattr(current_model, "model") and hasattr(current_model, "config"):
         if hasattr(current_model.config, "vocab_size"):
@@ -243,14 +332,11 @@ def add_new_tokens(
             current_model.config.update({"vocab_size" : resize_target})
     pass
 
-    # Must tie lm_head and embed_tokens if they are tied!
-    # Otherwise error will occur on saving models ie use save_model
+    # Must re-tie lm_head and embed_tokens if they are tied, otherwise saving with save_model raises an error
     if is_tied: model.tie_weights()
 
     # Clear deleted GPU items
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()
+    collect_garbage(after = torch.cuda.empty_cache)
     return
 pass
 
@@ -259,17 +345,30 @@ pass
 _COUNT_INPUT_IDS_BATCH_SIZE = 1000
 
 
+def _rows_lack_input_ids(train_dataset):
+    """datasets.Dataset with no "input_ids" column and no custom transform (which could add one): still raw, and
+    fetching a row decodes every column (images, audio) only to skip it."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not isinstance(train_dataset, datasets.Dataset): return False
+    try:
+        if train_dataset.format.get("type") == "custom": return False
+        return "input_ids" not in train_dataset.column_names
+    except Exception:
+        return False
+pass
+
+
 def _count_input_ids(train_dataset, mapping):
     """Only .map is datasets specific; a plain list of rows gets this far. A row with no
     "input_ids" is skipped, as in the checks above."""
     # All Unsloth Zoo code licensed under LGPLv3
+    if _rows_lack_input_ids(train_dataset): return
     if hasattr(train_dataset, "map"):
         train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
         return
     pass
-    # `mapping` flattens its batch into one array, so passing the whole dataset is an
-    # O(total tokens) transient. Chunking is exactly equivalent because it accumulates into
-    # a counter and .map(batched=True) already calls it once per batch.
+    # mapping flattens its batch into one array, so passing the whole dataset is an O(total tokens) transient; chunking
+    # is exactly equivalent since it accumulates into a counter and .map(batched=True) already calls it once per batch
     batch = []
     for row in train_dataset:
         if "input_ids" not in row: continue
@@ -288,8 +387,7 @@ def _requires_arguments(method):
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError, AttributeError):
-        # signature() raises TypeError for unreadable metadata too, so the lookup
-        # cannot share a try with bind(): only bind() failing proves arguments.
+        # signature() also raises TypeError for unreadable metadata, so only bind() failing (not the lookup) proves the arguments don't fit
         return False
     try:
         signature.bind()
@@ -333,6 +431,55 @@ def _get_embedding_modules(model):
 pass
 
 
+def _dtensor_type():
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        try:
+            from torch.distributed._tensor import DTensor
+        except Exception:
+            return None
+    return DTensor
+pass
+
+
+@contextlib.contextmanager
+def _gathered_dtensor_weights(model, weights):
+    """FSDP2 DTensor weights cannot be sliced under inference mode. Swap in full copies (all-gather:
+    every rank must call this), then copy each rank's shard back into the same DTensor."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    owners = []
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is not None and any(param is w for w in weights):
+                owners.append((module, name, param))
+    full = {}
+    with torch.inference_mode(False):
+        for weight in weights:
+            if id(weight) not in full:
+                copy = weight.detach().full_tensor().clone()
+                full[id(weight)] = (weight, torch.nn.Parameter(copy, requires_grad = weight.requires_grad))
+        for module, name, param in owners:
+            module._parameters[name] = full[id(param)][1]
+    try:
+        yield
+    finally:
+        with torch.inference_mode(False), torch.no_grad():
+            for module, name, param in owners:
+                module._parameters[name] = param
+            try:
+                from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+            except ImportError:  # torch 2.4: only the private namespace has it
+                from torch.distributed._tensor._utils import compute_local_shape_and_global_offset
+            for weight, copy in full.values():
+                shape, offset = compute_local_shape_and_global_offset(
+                    copy.shape, weight.device_mesh, weight.placements
+                )
+                index = tuple(slice(o, o + n) for o, n in zip(offset, shape))
+                weight.to_local().copy_(copy.data[index])
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -355,6 +502,14 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
+    # Case-insensitive; before the gathers below so every rank skips the collectives together.
+    model_name = model.config._name_or_path
+    ignored_tokenizer_names = {
+        name.lower() for name in IGNORED_TOKENIZER_NAMES
+    }
+    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
+        return
+    pass
     # DeepSpeed ZeRO-3 partitioned the weights to empty placeholders: gather them outside inference mode
     # (all-gather writes param.data) and let rank 0's reset reach every partition (unsloth#225).
     partitioned = []
@@ -367,20 +522,15 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         with torch.inference_mode(False), \
             deepspeed.zero.GatheredParameters(partitioned, modifier_rank = 0), torch.inference_mode():
             return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
+    DTensor = _dtensor_type()
+    sharded = [w for w in (embeddings.weight, lm_head.weight) if DTensor is not None and isinstance(w, DTensor)]
+    if sharded:
+        with _gathered_dtensor_weights(model, sharded):
+            return fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES, eps)
     embedding_matrix = embeddings.weight
     lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-
-    # Ignore some model checks for now. Normalize both the model name and caller-
-    # provided entries so the comparison is case-insensitive in either direction.
-    model_name = model.config._name_or_path
-    ignored_tokenizer_names = {
-        name.lower() for name in IGNORED_TOKENIZER_NAMES
-    }
-    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
-        return
-    pass
 
     # Sometimes the sizes can be different like in vision models
     # Ie <image> is in input, but not in output
@@ -388,10 +538,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     embedding_matrix = embedding_matrix[:min_size]
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
-    # Get untrained tokens
     indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
         (torch.amin(embedding_matrix, axis = 1) >= -eps)
-    # Check lm_head as well
 
     # Does NOT work for Llama 3.1!!
     indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
@@ -414,10 +562,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     indicator_untrained2 = indicator_untrained2 | torch.zeros_like(indicator_untrained2)
     indicator_untrained2[final_bad_lm_head] = True
 
-    # Combine both checks
     indicator_untrained = indicator_untrained1.to("cpu") & indicator_untrained2.to("cpu")
 
-    # Remove pad token and other important token possibilities
     special_tokens = (
         "bos_token",
         "eos_token",
@@ -439,38 +585,31 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
 
-    # Get set and actual tokens
     where_untrained = where_untrained.tolist()
     if len(where_untrained) == 0: return
 
-    # Remove untrained indices where it's longer
     
     where_untrained_set = frozenset(where_untrained)
     actual_bad_tokens = tokenizer.convert_ids_to_tokens(where_untrained)
-    # Remove None items in actual_bad_tokens
     actual_bad_tokens = [x for x in actual_bad_tokens if x is not None]
 
-    # Check if tokenizer and training datasets have bad tokens
     if_bad_first  = False
     if_bad_second = False
-    # Check tokenizer's chat template for any untrained tokens
     if chat_template is not None:
         if_bad_first = any(x in chat_template for x in actual_bad_tokens)
     pass
 
     if isinstance(train_dataset, datasets.IterableDataset):
-        # Skip the check, since the code below assumes
-        # an indexable dataset
         return
 
-    # Check the first 250, last 250 input_ids
-    size_dataset = len(train_dataset)
+    # Check the first 250, last 250 input_ids; raw rows would all be skipped, so read none
+    size_dataset = 0 if _rows_lack_input_ids(train_dataset) else len(train_dataset)
     size = min(size_dataset, 250)
     for j in range(size):
         input_ids = train_dataset[j]
         if "input_ids" in input_ids:
             input_ids = input_ids["input_ids"]
-            if_bad = any(item in where_untrained_set for item in input_ids)
+            if_bad = not where_untrained_set.isdisjoint(input_ids)
             if if_bad:
                 if_bad_second = True
                 break
@@ -478,14 +617,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         pass
     pass
 
-    # Check last 250
     if not if_bad_second:
         left = max(size_dataset-250, 0)
         for j in range(left, size_dataset):
             input_ids = train_dataset[j]
             if "input_ids" in input_ids:
                 input_ids = input_ids["input_ids"]
-                if_bad = any(item in where_untrained_set for item in input_ids)
+                if_bad = not where_untrained_set.isdisjoint(input_ids)
                 if if_bad:
                     if_bad_second = True
                     break
@@ -494,10 +632,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         pass
     pass
 
-    # Check if bad tokens exists!
     if not if_bad_first and not if_bad_second: return
 
-    # Check if lm_head / embed_token are trainable!
     bad_not_trainable = False
     if not embedding_matrix.requires_grad: bad_not_trainable = True
     if not lm_head_matrix  .requires_grad: bad_not_trainable = True
@@ -507,8 +643,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         final_bad_items = []
         which_locations = []
 
-        # Re-check the first 250, last 250 input_ids
-        size_dataset = len(train_dataset)
         size = min(size_dataset, 250)
         for j in range(size):
             input_ids = train_dataset[j]
@@ -521,7 +655,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             pass
         pass
 
-        # Re-check last 250
         left = max(size_dataset-250, 0)
         for j in range(left, size_dataset):
             input_ids = train_dataset[j]
@@ -536,8 +669,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
 
         # If no bad tokens, possibly chat template itself has issues?
         if len(final_bad_items) == 0:
-            # Recheck 2000 and last 2000 items
-            size_dataset = len(train_dataset)
             size = min(size_dataset, 2000)
             for j in range(size):
                 input_ids = train_dataset[j]
@@ -550,7 +681,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
                 pass
             pass
 
-            # Re-check last 2000
             left = max(size_dataset-2000, 0)
             for j in range(left, size_dataset):
                 input_ids = train_dataset[j]
@@ -578,7 +708,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         )
     pass
 
-    # Count all the possible bad tokens
     final_counts = np.zeros(max(len(tokenizer), embedding_matrix.shape[0]), dtype = np.int64)
     def mapping(examples):
         input_ids = examples["input_ids"]
@@ -587,15 +716,12 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     pass
     _count_input_ids(train_dataset, mapping)
 
-    # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    # Remove bad tokens
     sum_embedding -= torch.sum(embedding_matrix[where_untrained], dtype = torch.float32, axis = 0)
     sum_lm_head   -= torch.sum(lm_head_matrix  [where_untrained], dtype = torch.float32, axis = 0)
 
-    # Find correct average by dividing by sum of trained tokens
     mean_embedding = (sum_embedding / n_trained)
     mean_lm_head   = (sum_lm_head   / n_trained)
 
@@ -608,7 +734,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     mean_embedding[where_null] = 0
     mean_lm_head  [where_null] = 0
 
-    # Set them to the mean
     print(
         "Unsloth: Setting embed_tokens & lm_head untrained tokens to "\
         "mean(trained) to counteract NaNs during training."
@@ -616,17 +741,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     embedding_matrix[where_untrained] = mean_embedding.to(embedding_matrix.dtype)
     lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
 
-    # Clean up
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()
+    collect_garbage(after = torch.cuda.empty_cache)
     pass
     return
 pass
 
 
-# Pad-token repair lives in the shared pad_token module (single source of truth
-# for unsloth + unsloth-zoo). Re-exported here for backwards compatibility.
+# Pad-token repair lives in the shared pad_token module (single source of truth for unsloth and unsloth-zoo); re-exported here for backwards compatibility.
 from .pad_token import (
     fix_pad_token,
     POSSIBLE_RESERVED_TOKENS,
@@ -660,16 +781,13 @@ def patch_tokenizer(model, tokenizer):
             return model, original_tokenizer
         tokenizer = inner
 
-    # Heal a bad/missing pad_token via the shared single source of truth: it picks
-    # a reserved pad-like token already in the vocab (text-only models never reuse
-    # a vision token), or adds one and raises if none exists, and stamps
-    # model.config / generation_config pad_token_id when it changes.
-    # Fixes https://github.com/unslothai/unsloth/issues/5 and #4104.
+    # Heals bad/missing pad_token via the shared pad_token module: picks a reserved pad-like vocab token (text-only
+    # models never reuse a vision token) or adds one and raises if none exists; stamps model.config / generation_config
+    # pad_token_id when it changes; fixes unsloth issues 5 and 4104
     model_config = getattr(model, "config", None)
     result = fix_pad_token(original_tokenizer, model = model, model_config = model_config)
 
-    # No-op case: tokenizer already had a valid pad_token, but the model config
-    # may still be missing pad_token_id - mirror it across.
+    # No-op case: the tokenizer already had a valid pad_token, but model config may still lack pad_token_id, so copy it across.
     if not result["changed"] and model is not None and model_config is not None:
         if getattr(model_config, "pad_token_id", None) is None:
             pad_token_id = getattr(tokenizer, "pad_token_id", None)
@@ -774,8 +892,7 @@ def patch_processor_call(processor):
                 kwargs["text"] = text
         return original_call(self, *args, **kwargs)
 
-    # Patch via a dynamic subclass reusing the original class name so
-    # save_pretrained writes the correct processor_class (fixes issue #4085).
+    # Patch via a dynamic subclass reusing the original class name so save_pretrained writes the correct processor_class (fixes issue 4085).
     original_class = processor.__class__
     patched_class = type(
         original_class.__name__,
@@ -794,7 +911,6 @@ def patch_processor_call(processor):
 
     processor._unsloth_patched_call = True
     return processor
-pass
 
 
 # Unsloth Zoo - Utilities for Unsloth
