@@ -36,6 +36,19 @@ _DISABLED_REASON = None # set on the first failed launch; everything falls back 
 _K = None               # compiled kernels, built on first use
 
 
+def _probe_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+        import triton.language  # noqa: F401
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+# Probed at import: a compiled frame that read _TRITON as None would recompile once a later eager call cached it.
+_TRITON = _probe_triton()
+
+
 def moe_triton_kernels_available(device = None) -> bool:
     global _TRITON
     if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
@@ -43,12 +56,11 @@ def moe_triton_kernels_available(device = None) -> bool:
     if device is not None and getattr(device, "type", None) != "cuda":
         return False
     if _TRITON is None:
-        try:
-            import triton  # noqa: F401
-            import triton.language  # noqa: F401
-            _TRITON = torch.cuda.is_available()
-        except Exception:
-            _TRITON = False
+        available = _probe_triton()
+        # Writing the global inside a traced autograd.Function is a graph break.
+        if torch.compiler.is_compiling():
+            return available
+        _TRITON = available
     return _TRITON
 
 
@@ -66,7 +78,11 @@ def _disable(where, exc):
     global _DISABLED_REASON
     # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
     if isinstance(exc, _autograd_control_flow_errors()):
-        raise exc
+        try:
+            raise exc
+        finally:
+            # exc's traceback holds this frame: keeping exc here is a cycle that pins the failed call's tensors.
+            del exc
     _DISABLED_REASON = f"{where}: {type(exc).__name__}: {exc}"
     logger.warning(
         "Unsloth: the Triton MoE kernels failed to compile or launch and are disabled "
@@ -84,7 +100,7 @@ def _kernels():
         q_ptr, out_ptr, code_ptr,
         absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr,
         n_bytes,
-        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,
+        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,  # double quant / nested block / bytes per program / int64 offsets
     ):
         pid = tl.program_id(0)
         if LONG_INDEXING:
@@ -110,8 +126,8 @@ def _kernels():
         tl.store(out_ptr + offs2, w, mask = (offs2 - n_bytes) < n_bytes)
 
     @triton.jit
-    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,
-                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):
+    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,  # hidden / top-k
+                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):  # tokens per tile / hidden per tile / eager product rounding
         pid_t = tl.program_id(0).to(tl.int64)
         hb = tl.program_id(1)
         offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
@@ -143,8 +159,8 @@ def _kernels():
                  mask = t_mask[:, None] & h_mask[None, :])
 
     @triton.jit
-    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,
-                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):
+    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,  # hidden / top-k
+                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):  # tokens per tile / hidden per tile
         pid = tl.program_id(0).to(tl.int64)
         hb = tl.program_id(1)
         offs_i = pid * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
@@ -158,8 +174,8 @@ def _kernels():
                  mask = i_mask[:, None] & h_mask[None, :])
 
     @triton.jit
-    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,
-                               ROUND_PRODUCT: tl.constexpr):
+    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,  # hidden / top-k / hidden per tile
+                               ROUND_PRODUCT: tl.constexpr):  # eager product rounding
         i = tl.program_id(0).to(tl.int64)
         t = tl.load(sorted_ptr + i).to(tl.int64) // TOPK
         acc = tl.zeros((BLOCK_H,), dtype = tl.float32)
@@ -211,8 +227,9 @@ def _launch_device(device):
     return torch.cuda.device(device)
 
 
-def nf4_dequant_triton(packed, quant_state, out_shape = None):
-    """NF4 blocksize-64 dequant in quant_state.dtype; None for any other state so bitsandbytes takes over."""
+def nf4_dequant_triton(packed, quant_state, out_shape = None, out = None):
+    """NF4 blocksize-64 dequant in quant_state.dtype; None for any other state so bitsandbytes takes over.
+    out: a contiguous tensor of that dtype and size to decode into."""
     if not moe_triton_kernels_available(packed.device):
         return None
     if (getattr(quant_state, "quant_type", None) != "nf4" or quant_state.blocksize != 64
@@ -229,6 +246,10 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     if numel != 2 * n_bytes:
         return None
     device = packed.device
+    if out is not None and (
+        out.numel() != numel or out.dtype != quant_state.dtype or out.device != device or not out.is_contiguous()
+    ):
+        return None
     code = quant_state.code
     absmax = quant_state.absmax
     nested = bool(quant_state.nested)
@@ -252,7 +273,7 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     BLOCK = 1024
     try:
         triton, kernel, _, _, _ = _get_kernels()
-        out = torch.empty(numel, dtype = quant_state.dtype, device = device)
+        out = torch.empty(numel, dtype = quant_state.dtype, device = device) if out is None else out.view(-1)
         with _launch_device(device):
             kernel[(triton.cdiv(n_bytes, BLOCK),)](
                 q, out, code, absmax, code2, absmax2, offset, n_bytes,

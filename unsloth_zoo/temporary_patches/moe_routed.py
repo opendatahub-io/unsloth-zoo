@@ -51,6 +51,8 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
+from unsloth_zoo.triton_fast_launch import launch as _fast_launch
+
 try:
     import triton
     import triton.language as tl
@@ -59,6 +61,21 @@ except Exception:  # pragma: no cover - no Triton, no routed path
 
 
 ACT_GPTOSS, ACT_SILU, ACT_GELU_TANH, ACT_GELU = 0, 1, 2, 3
+
+
+def _eager_out_of_dynamo(fn):
+    """fn inlined while Dynamo traces it, and run with Dynamo off otherwise. When Inductor skips a compiled frame
+    (SkipFrame, e.g. bfloat16 on a T4) the frame runs eagerly but Dynamo still converts every nested frame, and the
+    eager branches here (pointer tables, data_ptr, direct Triton launches) cannot be traced on their own."""
+    eager = torch.compiler.disable(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        return eager(*args, **kwargs)
+    return wrapper
+
 
 
 def _env_int(name, default):
@@ -98,20 +115,20 @@ if triton is not None:
 
     @triton.jit
     def _nf4_dot(W, A, A2, C2, offset, LUT, rows64, rmask, x_chunk, k0, K,
-                 BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
-                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+                 BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,  # nf4 block / nested absmax block / double quant
+                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr):  # tile out rows / tile K / K % BLOCK_K == 0
         # rows64 index the flat buffer's rows: absmax / state2 blocks are global indices.
         HALF_K: tl.constexpr = BLOCK_K // 2
         NB: tl.constexpr = BLOCK_K // BLOCKSIZE
         half_k = tl.arange(0, HALF_K)
         nbs = tl.arange(0, NB)
-        kmask = (k0 + 2 * half_k) < K
+        kmask = ((k0 + 2 * half_k) < K) | EVEN_K
         b = tl.load(W + rows64[:, None] * (K // 2) + (k0 // 2 + half_k)[None, :],
                     mask = rmask[:, None] & kmask[None, :], other = 0).to(tl.int32)
         # High nibble is the earlier element, as bitsandbytes packs it.
         w = tl.reshape(tl.join(tl.load(LUT + (b >> 4)), tl.load(LUT + (b & 15))), (BLOCK_N, BLOCK_K))
         part = tl.sum(tl.reshape(w * x_chunk[None, :], (BLOCK_N, NB, BLOCKSIZE)), axis = 2)
-        bmask = rmask[:, None] & ((k0 + nbs * BLOCKSIZE) < K)[None, :]
+        bmask = rmask[:, None] & (((k0 + nbs * BLOCKSIZE) < K) | EVEN_K)[None, :]
         blk = rows64[:, None] * (K // BLOCKSIZE) + (k0 // BLOCKSIZE + nbs)[None, :]
         if NESTED:
             q = tl.load(A + blk, mask = bmask, other = 0).to(tl.int32)
@@ -121,7 +138,7 @@ if triton is not None:
         return tl.sum(part * a, axis = 1)
 
     @triton.jit
-    def _expert_tables(e, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, NESTED: tl.constexpr, STACKED: tl.constexpr):
+    def _expert_tables(e, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, NESTED: tl.constexpr, STACKED: tl.constexpr):  # double quant / stacked weights vs pointer table
         if STACKED:
             W = W_PTRS
             A = A_PTRS
@@ -146,7 +163,7 @@ if triton is not None:
         return W, A, A2, C2, offset
 
     @triton.jit
-    def _lora_ptr(PTRS, e, LORA_KIND: tl.constexpr):
+    def _lora_ptr(PTRS, e, LORA_KIND: tl.constexpr):  # 0 stacked, 1-3 ptr table fp32/bf16/fp16
         # Expert e's own adapter weight from an int64 table of pointers (1 / 2 / 3: fp32 / bf16 / fp16).
         if LORA_KIND == 2:
             return tl.load(PTRS + e).to(tl.pointer_type(tl.bfloat16))
@@ -157,7 +174,7 @@ if triton is not None:
 
     @triton.jit
     def _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, scaling, stride_be, stride_bn, stride_br,
-                R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):
+                R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):  # LoRA rank / rank pow2 / LoRA weight kind
         j = tl.arange(0, R_PAD)
         jmask = j < R
         if LORA_KIND == 0:
@@ -170,7 +187,7 @@ if triton is not None:
         return acc + tl.sum(b.to(tl.float32) * h.to(tl.float32)[None, :], axis = 1) * scaling
 
     @triton.jit
-    def _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND: tl.constexpr):
+    def _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND: tl.constexpr):  # 0 none, 1-3 ptr table, 4 stacked
         # 1 / 2 / 3: pointer table (fp32 / bf16 / fp16), 4: stacked [E, N].
         if BIAS_KIND == 4:
             B = BIAS + e * N
@@ -183,7 +200,7 @@ if triton is not None:
         return tl.load(B + rows64, mask = rmask, other = 0.0).to(tl.float32)
 
     @triton.jit
-    def _gated_act(gate, up, alpha, limit, ACT: tl.constexpr):
+    def _gated_act(gate, up, alpha, limit, ACT: tl.constexpr):  # 0 gpt-oss, 1 silu, 2 gelu tanh, 3 gelu
         if ACT == 0:
             # gpt-oss: clamp, then (up + 1) * gate * sigmoid(alpha * gate).
             gate = tl.minimum(gate, limit)
@@ -203,10 +220,10 @@ if triton is not None:
     def _routed_gate_up_kernel(
         X, IDX, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, BIAS, LORA_B, LORA_H, OUT, N, K,
         alpha, limit, scaling, stride_be, stride_bn, stride_br,
-        TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
-        STACKED: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr,
-        BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
-        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,  # top-k / nf4 block / nested block / double quant
+        STACKED: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr,  # stacked weights / activation id / gate-up interleaved
+        BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,  # bias kind / LoRA / LoRA rank / rank pow2
+        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,  # LoRA weight kind / tile N / tile K / K divisible
     ):
         # Each program owns BLOCK_N // 2 intermediate columns; its rows alternate gate, up.
         alpha = alpha.to(tl.float32)
@@ -230,9 +247,9 @@ if triton is not None:
         x_row = X + (p // TOP_K).to(tl.int64) * K
         acc = tl.zeros([BLOCK_N], dtype = tl.float32)
         for k0 in range(0, K, BLOCK_K):
-            x = tl.load(x_row + k0 + ks, mask = (k0 + ks) < K, other = 0.0).to(tl.float32)
+            x = tl.load(x_row + k0 + ks, mask = ((k0 + ks) < K) | EVEN_K, other = 0.0).to(tl.float32)
             acc += _nf4_dot(W, A, A2, C2, offset, LUT, wrows, rmask, x, k0, K,
-                            BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K)
+                            BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K, EVEN_K)
         if BIAS_KIND != 0:
             acc += _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND)
         if HAS_LORA:
@@ -247,10 +264,10 @@ if triton is not None:
     def _routed_down_kernel(
         X, IDX, RW, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, BIAS, LORA_B, LORA_H, OUT, N, K,
         RW_STRIDE, scaling, stride_be, stride_bn, stride_br,
-        TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,
-        NESTED: tl.constexpr, STACKED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr,
-        R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
+        TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,  # top-k / dense [T, E] weights / nf4 block / nested block
+        NESTED: tl.constexpr, STACKED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr,  # double quant / stacked / bias kind / LoRA
+        R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,  # LoRA rank / rank pow2 / LoRA kind / tile N
+        BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,  # tile K / K % BLOCK_K == 0
     ):
         # Fixed-order top-k sum, one store: no atomics, deterministic.
         t = tl.program_id(0)
@@ -273,9 +290,9 @@ if triton is not None:
                 wrows = rows64
             acc = tl.zeros([BLOCK_N], dtype = tl.float32)
             for k0 in range(0, K, BLOCK_K):
-                x = tl.load(X + s * K + k0 + ks, mask = (k0 + ks) < K, other = 0.0).to(tl.float32)
+                x = tl.load(X + s * K + k0 + ks, mask = ((k0 + ks) < K) | EVEN_K, other = 0.0).to(tl.float32)
                 acc += _nf4_dot(W, A, A2, C2, offset, LUT, wrows, rmask, x, k0, K,
-                                BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K)
+                                BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K, EVEN_K)
             if BIAS_KIND != 0:
                 acc += _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND)
             if HAS_LORA:
@@ -285,8 +302,8 @@ if triton is not None:
         tl.store(OUT + t.to(tl.int64) * N + rows, out.to(OUT.dtype.element_ty), mask = rmask)
 
     @triton.jit
-    def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,
-                       BLOCK_K: tl.constexpr):
+    def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,  # LoRA rank / LoRA weight kind
+                       BLOCK_K: tl.constexpr):  # tile along K (in features)
         p = tl.program_id(0)
         j = tl.program_id(1)
         e = tl.load(IDX + p).to(tl.int64)
@@ -304,7 +321,7 @@ if triton is not None:
     @triton.jit
     def _routed_lora_a_kernel(
         X, IDX, A, OUT, K, ROW_DIV, stride_x, stride_ae, stride_ak, stride_ar,
-        R: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
+        R: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,  # LoRA rank / rank block / tile K
     ):
         # One program per (slot, rank block): decode is latency bound, fan-out beats coalescing.
         p = tl.program_id(0)
@@ -327,8 +344,8 @@ if triton is not None:
     @triton.jit
     def _routed_lora_b_kernel(
         BASE, PREV, H, IDX, B, OUT, N, scaling, stride_base, stride_be, stride_br, stride_bn,
-        HAS_BASE: tl.constexpr, HAS_PREV: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        HAS_BASE: tl.constexpr, HAS_PREV: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,  # add base / add previous delta / LoRA rank / rank pow2
+        BLOCK_N: tl.constexpr,  # tile along N (out features)
     ):
         # PREV deltas are summed before BASE, as one (x @ A @ B) delta would be.
         p = tl.program_id(0)
@@ -350,7 +367,7 @@ if triton is not None:
     @triton.jit
     def _nf4_select_dequant_kernel(
         Q, OUT, UNIQ, LUT, ABSMAX, CODE2, ABSMAX2, OFFSET, BYTES_PER_EXPERT,
-        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
+        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,  # nf4 block / nested block / double quant / bytes per program
     ):
         # Bit-identical to bitsandbytes only with fp fusion off (product, then add, two roundings).
         g = tl.program_id(0)
@@ -382,13 +399,13 @@ if triton is not None:
         stride_xr,
         stride_we, stride_wk, stride_wn,
         stride_be,
-        HAS_BIAS: tl.constexpr,
-        P_PAD: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        SPLIT_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,  # expert bias
+        P_PAD: tl.constexpr,  # routed slots pow2
+        BLOCK_N: tl.constexpr,  # tile along N (out features)
+        BLOCK_K: tl.constexpr,  # tile along K (in features)
+        SPLIT_K: tl.constexpr,  # split-K partial count
         LORA_A = None, H_OUT = None, stride_lae = 0, stride_lak = 0, stride_lar = 0,
-        HAS_LORA_A: tl.constexpr = False, R: tl.constexpr = 1, R_PAD: tl.constexpr = 16,
+        HAS_LORA_A: tl.constexpr = False, R: tl.constexpr = 1, R_PAD: tl.constexpr = 16,  # fused LoRA A / LoRA rank / rank pow2
     ):
         e = tl.program_id(0)
         nb = tl.program_id(1)
@@ -450,6 +467,11 @@ def _block_k(K, blocksize):
     return max(blocksize, min(1024, triton.next_power_of_2(K)))
 
 
+def _even_k(K, block_k):
+    # Same values without the K masks; HIP keeps the masked kernel (unmeasured there).
+    return K % block_k == 0 and torch.version.hip is None
+
+
 def _lora_args(lora, dummy):
     if lora is None:
         return dummy, dummy, 0.0, 1, (0, 0, 0), 0
@@ -463,49 +485,62 @@ def _lora_args(lora, dummy):
     return B, H, float(scaling), B.shape[-1], (B.stride(0), B.stride(1), B.stride(2)), 0
 
 
+_PTRS_EQUAL = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
+
+
 def _bias_args(tb):
     # Resolved per launch: bitsandbytes recasts Linear4bit.bias into new storage on dtype change.
     bias = tb["bias"]
     if isinstance(bias, (list, tuple)):
+        # Reuse the previous table while every bias keeps address, dtype and device (one C call).
+        last = tb.get("_bias_last")
+        if last is not None and type(bias) is list and len(bias) == len(last[1]):
+            b0 = bias[0]
+            if b0.dtype is last[3] and b0.device == last[4] and _PTRS_EQUAL(bias, last[0], last[1]):
+                return last[2]
         got = lora_pointer_table(bias)
         if got is not None:
+            if _PTRS_EQUAL is not None and type(bias) is list:
+                tb["_bias_last"] = ([b.data_ptr() for b in bias], list(range(len(bias))), got, bias[0].dtype, bias[0].device)
             return got
         return torch.stack([b.float() for b in bias]), 4
     return bias, tb["bias_kind"]
 
 
 def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, interleaved = True):
+    block_k = _block_k(tb["K"], tb["blocksize"])
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     bias, bias_kind = _bias_args(tb)
-    # Triton launches on the current device, not the tensors' (multi-GPU device_map).
-    with torch.cuda.device(x.device):
-        _routed_gate_up_kernel[(idx.numel(), triton.cdiv(tb["N"], 4))](
-            x, idx, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
-            bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
-            float(alpha), float(limit), scaling, bs[0], bs[1], bs[2],
-            TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
-            STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
-            BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
-            LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
-            enable_fp_fusion = True,
-        )
+    # Launches on the tensors' device, not the current one (multi-GPU device_map).
+    _fast_launch(
+        _routed_gate_up_kernel, (idx.numel(), triton.cdiv(tb["N"], 4)),
+        (x, idx, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
+         bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
+         float(alpha), float(limit), scaling, bs[0], bs[1], bs[2]),
+        dict(TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
+             STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
+             BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
+             LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k)),
+        x.get_device(), (out,), num_warps = 4, enable_fp_fusion = True,
+    )
     return out
 
 
 def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
+    block_k = _block_k(tb["K"], tb["blocksize"])
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     bias, bias_kind = _bias_args(tb)
-    with torch.cuda.device(x.device):
-        _routed_down_kernel[(out.shape[0], triton.cdiv(tb["N"], 4))](
-            x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
-            bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
-            rw.stride(0), scaling, bs[0], bs[1], bs[2],
-            TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
-            NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
-            HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
-            BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
-            enable_fp_fusion = True,
-        )
+    _fast_launch(
+        _routed_down_kernel, (out.shape[0], triton.cdiv(tb["N"], 4)),
+        (x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
+         bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
+         rw.stride(0), scaling, bs[0], bs[1], bs[2]),
+        dict(TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
+             NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
+             HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
+             BLOCK_N = 4, BLOCK_K = block_k, EVEN_K = _even_k(tb["K"], block_k)),
+        x.get_device(), (out,), num_warps = 4, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -843,26 +878,25 @@ def _launch_expert(x, idx, weight, bias, out, row_div, lora_a = None, h_out = No
     E, K = weight.shape[0], weight.shape[1]
     c = _expert_config(P)
     grid = (E, triton.cdiv(N, c["BLOCK_N"]) + (lora_a is not None), S)
-    kw = {}
+    args = (x, idx, weight, bias if bias is not None else weight, out, P, N, K, row_div, x.stride(0),
+            weight.stride(0), weight.stride(1), weight.stride(2), bias.stride(0) if bias is not None else 0)
+    consts = dict(HAS_BIAS = bias is not None, P_PAD = max(16, triton.next_power_of_2(P)),
+                  BLOCK_N = c["BLOCK_N"], BLOCK_K = c["BLOCK_K"], SPLIT_K = S)
     if lora_a is not None:
         # h_out [S, P, r] fp32 split-K partials of x @ lora_a[idx]; lora_a [E, K, r], any strides.
         r = lora_a.shape[2]
-        kw = dict(LORA_A = lora_a, H_OUT = h_out, stride_lae = lora_a.stride(0), stride_lak = lora_a.stride(1),
-                  stride_lar = lora_a.stride(2), HAS_LORA_A = True, R = r,
-                  R_PAD = max(16, triton.next_power_of_2(r)))
-    with torch.cuda.device(x.device):
-        _routed_bf16_expert_kernel[grid](
-            x, idx, weight, bias if bias is not None else weight, out,
-            P, N, K, row_div,
-            x.stride(0),
-            weight.stride(0), weight.stride(1), weight.stride(2),
-            bias.stride(0) if bias is not None else 0,
-            HAS_BIAS = bias is not None,
-            P_PAD = max(16, triton.next_power_of_2(P)),
-            BLOCK_N = c["BLOCK_N"], BLOCK_K = c["BLOCK_K"], SPLIT_K = S,
-            num_warps = c["num_warps"], num_stages = c["num_stages"], **kw,
-            enable_fp_fusion = True,
-        )
+        with torch.cuda.device(x.device):
+            _routed_bf16_expert_kernel[grid](
+                *args, **consts, LORA_A = lora_a, H_OUT = h_out, stride_lae = lora_a.stride(0),
+                stride_lak = lora_a.stride(1), stride_lar = lora_a.stride(2), HAS_LORA_A = True, R = r,
+                R_PAD = max(16, triton.next_power_of_2(r)),
+                num_warps = c["num_warps"], num_stages = c["num_stages"], enable_fp_fusion = True,
+            )
+        return out
+    consts.update(LORA_A = None, H_OUT = None, stride_lae = 0, stride_lak = 0, stride_lar = 0, HAS_LORA_A = False,
+                  R = 1, R_PAD = 16)
+    _fast_launch(_routed_bf16_expert_kernel, grid, args, consts, x.get_device(), (out,),
+                 num_warps = c["num_warps"], num_stages = c["num_stages"], enable_fp_fusion = True)
     return out
 
 
@@ -925,7 +959,7 @@ def _lora_delta(x_slots, idx, terms):
 if triton is not None:
 
     @triton.jit
-    def _lora_h_row(LORA_H, p, P, SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr):
+    def _lora_h_row(LORA_H, p, P, SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr):  # LoRA H split partials / LoRA rank / rank pow2
         # H[p] as the fixed-order sum of [SPLIT_H, P, R] fp32 partials.
         j = tl.arange(0, R_PAD)
         h = tl.zeros([R_PAD], dtype = tl.float32)
@@ -935,7 +969,7 @@ if triton is not None:
 
     @triton.jit
     def _lora_b_cols(LORA_B, h, e, cols, cmask, stride_lbe, stride_lbr, stride_lbn,
-                     R: tl.constexpr, R_PAD: tl.constexpr):
+                     R: tl.constexpr, R_PAD: tl.constexpr):  # LoRA rank / rank pow2
         # sum_j h[j] * B[e, j, cols] in fp32; B any float dtype and strides.
         j = tl.arange(0, R_PAD)
         b = tl.load(LORA_B + e * stride_lbe + j[:, None] * stride_lbr + cols[None, :] * stride_lbn,
@@ -947,8 +981,8 @@ if triton is not None:
         PART, IDX, LORA_B, LORA_H, OUT,
         P, I, alpha, limit, scaling,
         stride_lbe, stride_lbr, stride_lbn,
-        SPLIT_K: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr, HAS_LORA: tl.constexpr,
-        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,
+        SPLIT_K: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr, HAS_LORA: tl.constexpr,  # split-K partials / activation id / interleaved / LoRA
+        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,  # LoRA H splits / LoRA rank / rank pow2 / cols
     ):
         # Epilogue after the full K reduction (bias is in split 0): fixed-order split-K sum, LoRA B once, act.
         alpha = alpha.to(tl.float32)
@@ -989,8 +1023,8 @@ if triton is not None:
         PART, IDX, RW, LORA_B, LORA_H, OUT,
         P, N, RW_STRIDE, scaling,
         stride_lbe, stride_lbr, stride_lbn,
-        TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, SPLIT_K: tl.constexpr, HAS_LORA: tl.constexpr,
-        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,
+        TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, SPLIT_K: tl.constexpr, HAS_LORA: tl.constexpr,  # top-k / top-k pow2 / split-K partials / LoRA
+        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,  # LoRA H splits / LoRA rank / rank pow2 / cols
     ):
         # Fixed-order fp32 sum, one store: no atomics, deterministic.
         t = tl.program_id(0).to(tl.int64)
@@ -1052,14 +1086,13 @@ def _gate_up_act_launch(x, idx, weight, bias, lora_a, lora_b, lora_h, scaling, t
     out = torch.empty((P, N // 2), dtype = out_dtype, device = x.device)
     B, Hm, SH, r, bs = _lora_b_args(lora_b, h, part)
     BLOCK, warps = _finalize_block(P, N // 2, 512)
-    with torch.cuda.device(x.device):
-        _bf16_gate_up_finalize_kernel[(P, triton.cdiv(N // 2, BLOCK))](
-            part, idx, B, Hm, out,
-            P, N // 2, float(alpha), float(limit), float(scaling), bs[0], bs[1], bs[2],
-            SPLIT_K = S, ACT = act, INTERLEAVED = interleaved, HAS_LORA = lora_b is not None, SPLIT_H = SH,
-            R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
-            enable_fp_fusion = True,
-        )
+    _fast_launch(
+        _bf16_gate_up_finalize_kernel, (P, triton.cdiv(N // 2, BLOCK)),
+        (part, idx, B, Hm, out, P, N // 2, float(alpha), float(limit), float(scaling), bs[0], bs[1], bs[2]),
+        dict(SPLIT_K = S, ACT = act, INTERLEAVED = interleaved, HAS_LORA = lora_b is not None, SPLIT_H = SH,
+             R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK),
+        x.get_device(), (out,), num_warps = warps, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -1069,14 +1102,13 @@ def _down_sum_launch(x, idx, rw, weight, bias, lora_a, lora_b, lora_h, scaling, 
     out = torch.empty((P // top_k, N), dtype = out_dtype, device = x.device)
     B, Hm, SH, r, bs = _lora_b_args(lora_b, h, part)
     BLOCK, warps = _finalize_block(P // top_k, N, 1024)
-    with torch.cuda.device(x.device):
-        _bf16_down_finalize_kernel[(P // top_k, triton.cdiv(N, BLOCK))](
-            part, idx, rw, B, Hm, out,
-            P, N, rw.stride(0), float(scaling), bs[0], bs[1], bs[2],
-            TOP_K = top_k, TOP_K_PAD = triton.next_power_of_2(top_k), SPLIT_K = S, HAS_LORA = lora_b is not None,
-            SPLIT_H = SH, R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
-            enable_fp_fusion = True,
-        )
+    _fast_launch(
+        _bf16_down_finalize_kernel, (P // top_k, triton.cdiv(N, BLOCK)),
+        (part, idx, rw, B, Hm, out, P, N, rw.stride(0), float(scaling), bs[0], bs[1], bs[2]),
+        dict(TOP_K = top_k, TOP_K_PAD = triton.next_power_of_2(top_k), SPLIT_K = S, HAS_LORA = lora_b is not None,
+             SPLIT_H = SH, R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK),
+        x.get_device(), (out,), num_warps = warps, enable_fp_fusion = True,
+    )
     return out
 
 
@@ -1154,6 +1186,7 @@ def _routed_bf16_moe_fused(x, flat, rw, w_gu, w_dn, b_gu, b_dn, act, interleaved
     return routed_bf16_down_sum(inter, flat, rw, w_dn, b_dn, dn[0], dn[1], None, dn[2], top_k, out_dtype)
 
 
+@_eager_out_of_dynamo
 def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interleaved,
                     gu_lora = (), dn_lora = (), alpha = 1.702, limit = 7.0, out_dtype = None):
     """[T, H] MoE output from only the routed BF16 / FP16 experts."""
@@ -1307,6 +1340,8 @@ def _stacked_key(experts):
     return tuple(key) + biases
 
 
+# Eager only (data_ptr comparisons): also when a compiled frame Inductor skips calls it (see _eager_out_of_dynamo).
+@torch.compiler.disable
 def prepare_stacked_nf4(experts, hidden_dim = None):
     """Eagerly built or revalidated tables for stacked NF4 experts; None when unsupported."""
     state = experts.__dict__.get("_unsloth_routed_moe")
@@ -1516,6 +1551,27 @@ def _bf16_supported(device):
     return _bf16_supported_index(device.index if device.index is not None else torch.cuda.current_device())
 
 
+# Below sm80 (T4) the 16-bit routed kernels only pay off for one-token decode, since grouped_mm is faster from 2 tokens
+# up; this lists the visible CUDA devices below sm80, built once.
+_SUB_SM80_DEVICES = None
+
+
+def sub_sm80_devices():
+    global _SUB_SM80_DEVICES
+    if _SUB_SM80_DEVICES is None:
+        _SUB_SM80_DEVICES = frozenset(
+            i for i in range(torch.cuda.device_count()) if torch.cuda.get_device_capability(i)[0] < 8
+        )
+    return _SUB_SM80_DEVICES
+
+
+def routed_16bit_supported(device):
+    sub = sub_sm80_devices()
+    if not sub:
+        return True
+    return (device.index if device.index is not None else torch.cuda.current_device()) not in sub
+
+
 def _bf16_plan(experts, gu, dn, hidden_dim):
     if gu.dim() != 3 or dn.dim() != 3:
         return None
@@ -1536,7 +1592,8 @@ def _bf16_plan(experts, gu, dn, hidden_dim):
     dn_shape = tuple(dn.shape) if dn_in else (dn.shape[0], dn.shape[2], dn.shape[1])
     if gu_shape[1] != hidden_dim or dn_shape[2] != hidden_dim or gu_shape[2] != 2 * dn_shape[1]:
         return None
-    return gu_in, dn_in, act, bool(_gate_up_interleaved(experts))
+    # Last: one-token calls only (below sm80, see sub_sm80_devices).
+    return gu_in, dn_in, act, bool(_gate_up_interleaved(experts)), not routed_16bit_supported(gu.device)
 
 
 def _bf16_views(experts, hidden_dim):
@@ -1563,12 +1620,13 @@ def _bf16_views(experts, hidden_dim):
             experts.__dict__["_unsloth_routed_bf16"] = (key, plan, sem)
     if plan is None:
         return None
-    gu_in, dn_in, act, interleaved = plan
+    gu_in, dn_in, act, interleaved, one_token = plan
     w_gu = gu if gu_in else gu.transpose(1, 2)
     w_dn = dn if dn_in else dn.transpose(1, 2)
-    return w_gu, w_dn, act, interleaved
+    return w_gu, w_dn, act, interleaved, one_token
 
 
+@_eager_out_of_dynamo
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     """Experts output from only the routed experts, or None (callers run their usual path)."""
     # Reentrant checkpointing replays under grad through the other path, so skip in training.
@@ -1593,14 +1651,14 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
             return None
         if mode == "grouped":
             # torch._grouped_mm takes bf16 only (its fake impl rejects fp16 under compile).
-            from .moe_utils import _check_torch_grouped_mm_supported, moe_compute_dtype
-            if moe_compute_dtype(hidden_states) != torch.bfloat16 or not _check_torch_grouped_mm_supported():
+            from .moe_utils import _grouped_mm_supported_on, moe_compute_dtype
+            if moe_compute_dtype(hidden_states) != torch.bfloat16 or not _grouped_mm_supported_on(hidden_states.device):
                 return None
     else:
         if mode == "grouped":
             return None
         views = _bf16_views(experts, hidden_dim)
-        if views is None or top_k_index.numel() > BF16_MAX_SLOTS:
+        if views is None or top_k_index.numel() > BF16_MAX_SLOTS or (views[4] and top_k_index.shape[0] > 1):
             return None
     lora = _stash_lora(experts)
     if lora is False:
@@ -1629,7 +1687,7 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
             return None
         out = fn(state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
     else:
-        w_gu, w_dn, act, interleaved = views
+        w_gu, w_dn, act, interleaved, _ = views
         biases = (getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None))
         for b, n in zip(biases, (I2, hidden_dim)):
             # The kernel reads bias[e] + n: rows of a contiguous [E, N] tensor only.

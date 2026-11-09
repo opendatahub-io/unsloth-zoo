@@ -25,7 +25,8 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
         triton.Config({}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8]
     ],
-    key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
+    # Unsloth: unread B dropped so batch sizes do not re-tune or recompile.
+    key=['H', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -36,13 +37,12 @@ def chunk_local_cumsum_scalar_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -82,7 +82,7 @@ def chunk_local_cumsum_scalar_kernel(
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
     ],
-    key=['B', 'H', 'S', 'BT', 'IS_VARLEN', 'REVERSE'],
+    key=['H', 'S', 'BT', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -93,16 +93,15 @@ def chunk_local_cumsum_vector_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    S: tl.constexpr,  # feature dim
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # block along S
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -146,7 +145,7 @@ def chunk_local_cumsum_vector_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [1, 2, 3, 4]
     ],
-    key=['B', 'H', 'IS_VARLEN', 'REVERSE'],
+    key=['H', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -156,13 +155,12 @@ def chunk_global_cumsum_scalar_kernel(
     scale,
     cu_seqlens,
     T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
 ):
     i_nh = tl.program_id(0)
     i_n, i_h = i_nh // H, i_nh % H
@@ -208,7 +206,7 @@ def chunk_global_cumsum_scalar_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [1, 2, 3, 4]
     ],
-    key=['B', 'H', 'S', 'IS_VARLEN', 'REVERSE'],
+    key=['H', 'S', 'IS_VARLEN', 'REVERSE'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -218,15 +216,14 @@ def chunk_global_cumsum_vector_kernel(
     scale,
     cu_seqlens,
     T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    S: tl.constexpr,  # feature dim
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # block along S
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
 ):
     i_s, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -289,7 +286,6 @@ def chunk_local_cumsum_scalar(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
-        B=B,
         H=H,
         BT=BT,
         HEAD_FIRST=head_first,
@@ -330,7 +326,6 @@ def chunk_local_cumsum_vector(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
-        B=B,
         H=H,
         S=S,
         BT=BT,
@@ -364,7 +359,6 @@ def chunk_global_cumsum_scalar(
         scale=scale,
         cu_seqlens=cu_seqlens,
         T=T,
-        B=B,
         H=H,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
@@ -396,7 +390,6 @@ def chunk_global_cumsum_vector(
         scale=scale,
         cu_seqlens=cu_seqlens,
         T=T,
-        B=B,
         H=H,
         S=S,
         BS=BS,

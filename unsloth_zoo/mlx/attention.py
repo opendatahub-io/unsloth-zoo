@@ -15,10 +15,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Quantized-KV attention through `mx.fast.scaled_dot_product_attention` over a dequantized copy,
-once the `[B, HQ, L, S]` scores the runtimes materialize would cost more than the copy."""
+once the `[B, HQ, L, S]` scores the runtimes materialize would cost more than the copy, and Metal kernels for
+Qwen Sparse Attention (QSA) in mlx-vlm's qwen4_exp."""
 import functools
+import hashlib
+import math
 import os
 import re
+from typing import NamedTuple
 
 import mlx.core as mx
 
@@ -30,8 +34,7 @@ def _result_dtype(queries, q_keys, q_values):
 
 
 def _row_bytes(q_cache, group_size, dtype):
-    # Dequantized plus packed: a prefix view is compacted first, and contiguity is not visible
-    # from the arrays, so the compaction is charged always.
+    # Dequantized plus packed bytes; a prefix view is compacted first, and contiguity is not visible from the arrays, so compaction is always charged.
     packed = sum(part.shape[-1] * part.dtype.size for part in q_cache)
     return q_cache[1].shape[-1] * group_size * dtype.size + packed
 
@@ -43,11 +46,13 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     HKV = q_keys[0].shape[-3]
     scores = HQ * L * dtype.size
     copy = HKV * (_row_bytes(q_keys, group_size, dtype) + _row_bytes(q_values, group_size, dtype))
-    return scores > copy
+    padding = forced_padding_row_bytes(q_keys[1].shape[-1] * group_size, q_values[1].shape[-1] * group_size, HKV,
+                                       dtype.size, q_keys[0].shape[-2])
+    return scores > copy + padding
 
 
-# The calls mlx fuses (ScaledDotProductAttention::has_fused_kernel and use_fallback, mlx 0.32.3).
-# Elsewhere mlx builds the scores anyway, so the copy would cost extra rather than instead.
+# Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.3);
+# elsewhere mlx builds the scores anyway, so a copy would add cost rather than replace it.
 _FUSED_FULL_HEAD_DIMS = frozenset((64, 72, 80, 96, 128))
 _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
 _SPLIT_MIN_QUERIES = 1024
@@ -67,15 +72,21 @@ def _tf32_enabled():
     return _atoi(os.environ.get("MLX_ENABLE_TF32", "1")) != 0
 
 
-def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
-    from .nax import nax_available
+def _stock_runs_nax():
+    # mlx picks its NAX kernels from the hardware; `UNSLOTH_MLX_NAX=0` turns off only Unsloth's own routes.
+    from . import nax
 
+    return nax.nax_available() or (os.environ.get("UNSLOTH_MLX_NAX") == "0" and nax._nax_gpu()
+                                   and nax._stock_nax_kernels())
+
+
+def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
     B, HQ, L = queries.shape[0], queries.shape[-3], queries.shape[-2]
     S = q_keys[0].shape[-2]
     causal = isinstance(mask, str) and mask == "causal"
     if causal and L > S:
         return False
-    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and nax_available()
+    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
     if head_dim == value_dim == 256:
         if split and (causal or isinstance(mask, mx.array)):
             return True
@@ -114,9 +125,116 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
 
 
+# mlx builds full `[B, HQ, L, S]` scores for these causal calls; below the floors that is small and faster.
+_FORCED_MIN_QUERIES = 16
+_FORCED_MIN_KEYS = 8192
+
+
+def _forced_widths(head_dim, value_dim):
+    """The (head_dim, value_dim) a forced call runs at, or None. Zero padding leaves the attention exact."""
+    if head_dim == value_dim == 256:
+        return 256, 256
+    if (head_dim, value_dim) == (192, 128):
+        # No 192/128 kernel past 8 queries; NAX runs 256 faster than 192, elsewhere the reverse.
+        return (256, 256) if _stock_runs_nax() else (192, 192)
+    return None
+
+
+def _forces_fused(queries, n_keys, head_dim, value_dim, dtype, mask):
+    return (_forced_widths(head_dim, value_dim) is not None and isinstance(mask, str) and mask == "causal"
+            and _FORCED_MIN_QUERIES <= queries.shape[-2] <= n_keys and n_keys >= _FORCED_MIN_KEYS
+            and dtype != mx.float32 and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def forced_padding_row_bytes(head_dim, value_dim, kv_heads, dtype_size, n_keys):
+    """Bytes per cached token a forced call over `n_keys` holds in its padded copies of K and V."""
+    widths = _forced_widths(head_dim, value_dim)
+    if widths is None or dtype_size == 4 or n_keys < _FORCED_MIN_KEYS:
+        return 0
+    copied = (widths[0] if widths[0] != head_dim else 0) + (widths[1] if widths[1] != value_dim else 0)
+    return kv_heads * copied * dtype_size
+
+
+def _pad_width(x, width):
+    return x if x.shape[-1] == width else mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, width - x.shape[-1])])
+
+
+def _blocks_d512_scores(queries, n_keys, head_dim, value_dim, dtype, mask):
+    # mlx's use_blocked_d512: off NAX these calls hold about 256 queries' scores, not all of them.
+    return (head_dim == value_dim == 512 and isinstance(mask, str) and mask == "causal"
+            and _SPLIT_MIN_QUERIES <= queries.shape[-2] <= n_keys and dtype != mx.float32
+            and not _stock_runs_nax() and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
+    """Whether a loaded model's call avoids building full scores: mlx's own route or a forced one."""
+    route = (queries, q_keys[0].shape[-2], q_keys[1].shape[-1] * group_size, q_values[1].shape[-1] * group_size,
+             _result_dtype(queries, q_keys, q_values), mask)
+    return (fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
+            or _forces_fused(*route) or _blocks_d512_scores(*route))
+
+
+def fused_sdpa_over(stock):
+    """Wrap `mx.fast.scaled_dot_product_attention`; training keeps mlx's own dispatch."""
+    @functools.wraps(stock)
+    def sdpa(q, k, v, *, scale, mask=None, sinks=None, **kwargs):
+        from .utils import mlx_training_patches_active
+
+        if isinstance(mask, WindowMask):
+            original, window = mask
+            if (native_window_supported(q, k, v) and not kwargs and sinks is None
+                    and not mlx_training_patches_active()):
+                try:
+                    return stock(q, k, v, scale=scale, mask="causal", window_size=window, force_fused=True)
+                except ValueError:   # mlx has no fused windowed backward, so a gradient trace refuses it
+                    pass
+            # The model slices only array masks to the queries it keeps, so a descriptor arrives untrimmed.
+            mask = original
+            if isinstance(mask, mx.array) and mask.shape[-2] != q.shape[-2]:
+                mask = mask[..., -q.shape[-2]:, :]
+        if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
+                and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
+                and not mlx_training_patches_active()):
+            head_dim, value_dim = _forced_widths(k.shape[-1], v.shape[-1])
+            out = stock(_pad_width(q, head_dim), _pad_width(k, head_dim), _pad_width(v, value_dim), scale=scale,
+                        mask=mask, force_fused=True)
+            return out if value_dim == v.shape[-1] else out[..., :v.shape[-1]]
+        return stock(q, k, v, scale=scale, mask=mask, sinks=sinks, **kwargs)
+    return sdpa
+
+
+class WindowMask(NamedTuple):
+    """An internally built mask retained alongside its native causal-window equivalent."""
+    original: mx.array | str
+    window: int
+
+
+def native_window_available():
+    """Whether this runtime and device can run native-window attention."""
+    return (os.environ.get("UNSLOTH_MLX_NATIVE_WINDOW", "1") != "0"
+            and "window_size" in (mx.fast.scaled_dot_product_attention.__doc__ or "")
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def native_window_supported(q, k, v):
+    """The large-row, head-dimension256 prefill cases qualified against FP32."""
+    return (native_window_available() and q.dtype == k.dtype == v.dtype
+            and q.dtype in (mx.bfloat16, mx.float16) and q.ndim == k.ndim == v.ndim == 4
+            and _SPLIT_MIN_QUERIES <= q.shape[-2] <= k.shape[-2]
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256)
+
+
+def install_fused_attention():
+    """Route eligible calls of every runtime onto the fused kernel, idempotently."""
+    stock = mx.fast.scaled_dot_product_attention
+    if not getattr(stock, _FUSED_PATCH_FLAG, False):
+        patched = fused_sdpa_over(stock)
+        setattr(patched, _FUSED_PATCH_FLAG, True)
+        mx.fast.scaled_dot_product_attention = patched
+
+
 def dequantized_sdpa(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8):
-    """The fused kernel over one dequantized copy. An emptied row averages, as the unfused path
-    does: mlx masks with a finite minimum, not -inf."""
+    """Fused SDPA over one dequantized copy; an emptied row averages as in the unfused path, since mlx masks with a finite minimum rather than -inf."""
     dtype = _result_dtype(queries, q_keys, q_values)
     keys = mx.dequantize(*q_keys, group_size=group_size, bits=bits).astype(dtype)
     values = mx.dequantize(*q_values, group_size=group_size, bits=bits).astype(dtype)
@@ -130,7 +248,7 @@ def quantized_sdpa_over(unfused):
                        **kwargs):
         # An argument this wrapper predates has no fused equivalent: delegate, never drop it.
         if (not kwargs
-                and fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
+                and runtime_fuses(queries, q_keys, q_values, group_size, mask)
                 and dequantizing_is_smaller(queries, q_keys, q_values, group_size)):
             return dequantized_sdpa(queries, q_keys, q_values, scale, mask,
                                     group_size=group_size, bits=bits)
@@ -140,6 +258,7 @@ def quantized_sdpa_over(unfused):
 
 
 _PATCH_FLAG = "_unsloth_quantized_attention_patch"
+_FUSED_PATCH_FLAG = "_unsloth_fused_attention_patch"
 
 _PATCH_TARGETS = ("mlx_lm.models.base", "mlx_vlm.models.base")
 
@@ -203,6 +322,13 @@ def _qsa_attention_training_over(original):
     return attention
 
 
+def _training_wrapper(original, wrap):
+    # The inference routes' source contracts read the marker to see through the wrapper.
+    wrapped = wrap(original)
+    wrapped._unsloth_sparse_attention_original = original
+    return wrapped
+
+
 def install_sparse_attention_training():
     """Route loaded custom attention kernels through differentiable training paths."""
     import sys
@@ -222,10 +348,1027 @@ def install_sparse_attention_training():
             wrapped = original
             original = wrapped._unsloth_sparse_attention_original
         else:
-            wrapped = wrap(original)
-            wrapped._unsloth_sparse_attention_original = original
+            wrapped = _training_wrapper(original, wrap)
         for path, consumer in list(sys.modules.items()):
             if path.startswith("mlx_vlm.") and consumer is not None:
                 for alias, value in list(vars(consumer).items()):
                     if value is original:
                         setattr(consumer, alias, wrapped)
+
+
+# QSA block selection.
+_SELECT_HEADER = """
+#include <metal_simdgroup>
+using namespace metal;
+
+// mlx-vlm's sum(maximum(head_scores, 0), heads) / sqrt(d): maximum keeps NaN, the column sum adds
+// head by head, the divide is IEEE.
+inline float qsa_block_score(const device float* scores, size_t head_stride, uint heads, float divisor) {
+    float total = 0.0f;
+    for (uint h = 0; h < heads; ++h) {
+        const float v = scores[h * head_stride];
+        total = (metal::isnan(v) ? v : (v > 0.0f ? v : 0.0f)) + total;
+    }
+    return metal::precise::divide(total, divisor);
+}
+
+// Block scores are +0, positive or NaN; MLX's sort puts NaN above +inf.
+inline uint qsa_order_key(float score) {
+    return metal::isnan(score) ? 0xFFFFFFFFu : as_type<uint>(score);
+}
+"""
+
+# One threadgroup per query row: a radix select over order keys finds the top-k threshold; ties keep the highest-index
+# blocks (last k of MLX's stable argsort); -1s, then picks ascending.
+_SELECT_SOURCE = """
+    constexpr uint TG = 1024;
+    constexpr uint NSG = TG / 32;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint nb = uint(dims[0]);
+    const uint L = uint(dims[1]);
+    const uint b = row / L;
+    const uint c = metal::min(uint(metal::max(complete[row], 0)), nb);
+    device int* picks = out + size_t(row) * TOPK;
+
+    if (c <= TOPK) {
+        for (uint i = tid; i < TOPK; i += TG) {
+            picks[i] = i < TOPK - c ? -1 : int(i - (TOPK - c));
+        }
+        return;
+    }
+
+    threadgroup atomic_uint hist[256];
+    threadgroup uint decided[2];
+    threadgroup uint sg_counts[NSG];
+    device uint* keys = scratch + size_t(row) * nb;
+    const device float* row_scores = scores + (size_t(b) * H * L + (row - b * L)) * nb;
+    const size_t head_stride = size_t(L) * nb;
+    const float div = divisor[0];
+
+    uint prefix = 0;
+    uint remaining = TOPK;
+    for (uint pass = 0; pass < 4; ++pass) {
+        const uint shift = 24 - 8 * pass;
+        if (tid < 256) {
+            atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < c; e += TG) {
+            uint key;
+            if (pass == 0) {
+                key = qsa_order_key(qsa_block_score(row_scores + e, head_stride, H, div));
+                keys[e] = key;
+            } else {
+                key = keys[e];
+            }
+            if (pass == 0 || (key >> (shift + 8)) == prefix) {
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            // Lane l owns digits 8l..8l+7: find the digit where the count above reaches `remaining`.
+            uint counts[8];
+            uint owned = 0;
+            for (uint j = 0; j < 8; ++j) {
+                counts[j] = atomic_load_explicit(&hist[8 * lane + j], memory_order_relaxed);
+                owned += counts[j];
+            }
+            const uint above = simd_sum(owned) - simd_prefix_inclusive_sum(owned);
+            if (above < remaining && remaining <= above + owned) {
+                uint acc = above;
+                for (int j = 7; j >= 0; --j) {
+                    if (acc + counts[j] >= remaining) {
+                        decided[0] = (prefix << 8) | (8 * lane + uint(j));
+                        decided[1] = remaining - acc;
+                        break;
+                    }
+                    acc += counts[j];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = decided[0];
+        remaining = decided[1];
+    }
+
+    const uint threshold = prefix;
+    const uint skip = atomic_load_explicit(&hist[threshold & 255u], memory_order_relaxed) - remaining;
+    uint tie_carry = 0;
+    uint pick_carry = 0;
+    for (uint base = 0; base < c; base += TG) {
+        const uint e = base + tid;
+        const uint key = e < c ? keys[e] : 0u;
+        const uint tie = (e < c && key == threshold) ? 1u : 0u;
+        uint tie_before = 0, tie_chunk = 0;
+        if (skip) {
+            const uint ties = simd_sum(tie);
+            if (lane == 0) {
+                sg_counts[sg] = ties;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = 0; s < NSG; ++s) {
+                tie_before += s < sg ? sg_counts[s] : 0u;
+                tie_chunk += sg_counts[s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            tie_before += simd_prefix_exclusive_sum(tie);
+        }
+        const uint pick = (e < c && (key > threshold || (tie && tie_carry + tie_before >= skip))) ? 1u : 0u;
+        const uint simd_picks = simd_sum(pick);
+        if (lane == 0) {
+            sg_counts[sg] = simd_picks;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint pick_before = 0, pick_chunk = 0;
+        for (uint s = 0; s < NSG; ++s) {
+            pick_before += s < sg ? sg_counts[s] : 0u;
+            pick_chunk += sg_counts[s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (pick) {
+            picks[pick_carry + pick_before + simd_prefix_exclusive_sum(pick)] = int(e);
+        }
+        tie_carry += tie_chunk;
+        pick_carry += pick_chunk;
+    }
+"""
+
+
+@functools.cache
+def _select_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name = "unsloth_qsa_select_blocks", input_names = ["scores", "complete", "divisor", "dims"],
+        output_names = ["out", "scratch"], header = _SELECT_HEADER, source = _SELECT_SOURCE,
+    )
+
+
+@functools.cache
+def _divisor(head_dim):
+    # The float32 MLX makes of the Python float in `scores / math.sqrt(head_dim)`.
+    return mx.array([math.sqrt(head_dim)], dtype = mx.float32)
+
+
+def select_blocks(scores, complete, topk, head_dim):
+    """mlx-vlm QSA block selection on float32 [B, H, L, blocks] scores, one launch; returns [B, L, topk] int32:
+    argpartition's picks among each row's first complete blocks, -1 per missing pick first, then ascending."""
+    B, H, L, nb = scores.shape
+    if topk < 1:
+        raise ValueError(f"Unsloth: QSA block selection needs topk >= 1, got {topk}")
+    out, _ = _select_kernel()(
+        inputs = [mx.contiguous(scores), mx.contiguous(complete.astype(mx.int32)), _divisor(head_dim),
+                  mx.array([nb, L], dtype = mx.int32)],
+        template = [("H", H), ("TOPK", topk)],
+        grid = (1024, B * L, 1), threadgroup = (1024, 1, 1),
+        output_shapes = [(B, L, topk), (B * L, max(nb, 1))], output_dtypes = [mx.int32, mx.uint32],
+    )
+    return out
+
+
+# Reductions over a fragment row: its lanes differ in bits 0 and 3 in both kernels' layouts.
+_ROW_REDUCE = """
+template <typename T>
+inline T row_max(T x) {
+  x = metal::max(x, simd_shuffle_xor(x, ushort(1)));
+  return metal::max(x, simd_shuffle_xor(x, ushort(8)));
+}
+
+template <typename T>
+inline T row_sum(T x) {
+  x += simd_shuffle_xor(x, ushort(1));
+  return x + simd_shuffle_xor(x, ushort(8));
+}
+"""
+
+# Tensor-unit QSA prefill attention over the selected blocks (inexact: fp32 sums in another order).
+_PREFILL_HEADER = """
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+#define UNROLL _Pragma("clang loop unroll(full)")
+
+// MLX's 16x16 tensor-unit fragment and its 16x32x16 matmul
+// (mlx/backend/metal/kernels/steel/attn/nax.h, Copyright © 2025 Apple Inc., MIT).
+template <typename C, typename A, typename B, bool TB>
+inline void nax_mma(thread vec<C, 8>& c0, thread vec<C, 8>& c1, const thread vec<A, 8>& a,
+                    const thread vec<B, 8>& b0, const thread vec<B, 8>& b1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, 32, 16, false, TB, true, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto ca = op.template get_left_input_cooperative_tensor<A, B, C>();
+  auto cb = op.template get_right_input_cooperative_tensor<A, B, C>();
+  auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), C>();
+  UNROLL for (short i = 0; i < 8; i++) {
+    ca[i] = a[i];
+    cb[i] = b0[i];
+    cb[8 + i] = b1[i];
+    cc[i] = c0[i];
+    cc[8 + i] = c1[i];
+  }
+  op.run(ca, cb, cc);
+  UNROLL for (short i = 0; i < 8; i++) {
+    c0[i] = cc[i];
+    c1[i] = cc[8 + i];
+  }
+}
+
+""" + _ROW_REDUCE[1:]
+
+# MLX NAX flash attention (steel_attention_nax.h) over gathered keys, one threadgroup per (query row, KV head); 32 keys
+# at a time from sorted picks (-1 first) then the partial tail; 16-byte gathers permute D, so Q must gather K's dims and
+# V the dims of the output store.
+_PREFILL_SOURCE = """
+    constexpr int D = 256;
+    const ushort lane = thread_index_in_simdgroup;
+    const int sg = simdgroup_index_in_threadgroup;
+    const int tq = threadgroup_position_in_grid.x;
+    const int kvh = threadgroup_position_in_grid.y;
+    const int kL = params[0];
+    const int L = params[1];
+    const float scale2 = scale[0] * 1.44269504089f;
+    threadgroup float partial[2 * 2 * 32 * 16];
+
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+
+    const int qe = query_ends[tq];
+    const int complete = qe >> 2;
+    const int nsel = min(TOPK, complete);
+    const int ntail = qe - (complete << 2);
+    const int U = nsel + (ntail > 0 ? 1 : 0);
+    const device int* blk = sel + size_t(tq) * TOPK + (TOPK - nsel);
+    // mlx-vlm sends no pick outside [0, complete); skipping them keeps any input from addressing past the keys.
+    auto unit_block = [&](int u) -> int {
+      if (u < nsel) {
+        const int b = blk[u];
+        return uint(b) < uint(complete) ? b : -1;
+      }
+      return u < U ? complete : -1;
+    };
+
+    bool row_ok[2];
+    const device bfloat* qrow[2];
+    UNROLL for (short i = 0; i < 2; i++) {
+      row_ok[i] = fm + 8 * i < GQA;
+      qrow[i] = (const device bfloat*)q + (size_t(kvh * GQA + (row_ok[i] ? fm + 8 * i : 0)) * L + tq) * D + fn;
+    }
+    const device bfloat* kh = (const device bfloat*)k + size_t(kvh) * kL * D + fn;
+    const device bfloat* vh = (const device bfloat*)v + size_t(kvh) * kL * D + sg * 128 + fn;
+
+    vec<float, 8> o[8];
+    UNROLL for (short d = 0; d < 8; d++) o[d] = 0.0f;
+    float m[2] = {-INFINITY, -INFINITY};
+    float l[2] = {0.0f, 0.0f};
+
+    for (int u0 = 0; u0 < U; u0 += 8) {
+      // Key rows this lane loads (fragment f, element row i) and visible tokens of its score columns.
+      uint krow[2][2];
+      int nvis[2];
+      UNROLL for (short f = 0; f < 2; f++) {
+        UNROLL for (short i = 0; i < 2; i++) {
+          const short slot = 16 * f + fm + 8 * i;
+          const int b = unit_block(u0 + (slot >> 2));
+          krow[f][i] = b < 0 ? 0u : uint(min(4 * b + (slot & 3), kL - 1));
+        }
+        const int u = u0 + ((16 * f + fn) >> 2);
+        const int b = unit_block(u);
+        nvis[f] = b < 0 ? 0 : (u < nsel ? 4 : ntail);
+      }
+
+      vec<float, 8> s[2];
+      s[0] = 0.0f;
+      s[1] = 0.0f;
+      UNROLL for (short d = sg * 8; d < sg * 8 + 8; d += 2) {
+        vec<bfloat, 8> qa[2], k0[2], k1[2];
+        UNROLL for (short i = 0; i < 2; i++) {
+          const vec<bfloat, 8> qv = row_ok[i] ? *(const device vec<bfloat, 8>*)(qrow[i] + 16 * d + fn) : vec<bfloat, 8>(0);
+          const vec<bfloat, 8> a = *(const device vec<bfloat, 8>*)(kh + krow[0][i] * D + 16 * d + fn);
+          const vec<bfloat, 8> c = *(const device vec<bfloat, 8>*)(kh + krow[1][i] * D + 16 * d + fn);
+          UNROLL for (short h = 0; h < 2; h++) {
+            UNROLL for (short j = 0; j < 4; j++) {
+              qa[h][4 * i + j] = qv[4 * h + j];
+              k0[h][4 * i + j] = a[4 * h + j];
+              k1[h][4 * i + j] = c[4 * h + j];
+            }
+          }
+        }
+        nax_mma<float, bfloat, bfloat, true>(s[0], s[1], qa[0], k0[0], k1[0]);
+        nax_mma<float, bfloat, bfloat, true>(s[0], s[1], qa[1], k0[1], k1[1]);
+      }
+      threadgroup float* buf = partial + ((u0 >> 3) & 1) * 1024 + lane * 16;
+      UNROLL for (short e = 0; e < 8; e++) {
+        buf[sg * 512 + e] = s[0][e];
+        buf[sg * 512 + 8 + e] = s[1][e];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      UNROLL for (short e = 0; e < 8; e++) {
+        s[0][e] += buf[(1 - sg) * 512 + e];
+        s[1][e] += buf[(1 - sg) * 512 + 8 + e];
+      }
+
+      UNROLL for (short i = 0; i < 2; i++) {
+        float smax = -INFINITY;
+        UNROLL for (short f = 0; f < 2; f++) {
+          UNROLL for (short j = 0; j < 4; j++) {
+            const float x = j < nvis[f] ? s[f][4 * i + j] * scale2 : -INFINITY;
+            s[f][4 * i + j] = x;
+            smax = metal::max(smax, x);
+          }
+        }
+        const float mnew = metal::max(m[i], row_max(smax));
+        const float mref = mnew == -INFINITY ? 0.0f : mnew;
+        const float factor = fast::exp2(m[i] - mref);
+        m[i] = mnew;
+        float psum = 0.0f;
+        UNROLL for (short f = 0; f < 2; f++) {
+          UNROLL for (short j = 0; j < 4; j++) {
+            const float p = fast::exp2(s[f][4 * i + j] - mref);
+            s[f][4 * i + j] = p;
+            psum += p;
+          }
+        }
+        l[i] = l[i] * factor + row_sum(psum);
+        UNROLL for (short d = 0; d < 8; d++) {
+          UNROLL for (short j = 0; j < 4; j++) o[d][4 * i + j] *= factor;
+        }
+      }
+
+      // The tensor units read float operands at 10 mantissa bits; a half part plus its remainder keeps ~22 bits of P.
+      vec<float, 8> hi[2], lo[2];
+      UNROLL for (short f = 0; f < 2; f++) {
+        UNROLL for (short e = 0; e < 8; e++) {
+          hi[f][e] = float(half(s[f][e]));
+          lo[f][e] = s[f][e] - hi[f][e];
+        }
+      }
+      UNROLL for (short d = 0; d < 8; d += 2) {
+        UNROLL for (short f = 0; f < 2; f++) {
+          vec<bfloat, 8> v0, v1;
+          UNROLL for (short i = 0; i < 2; i++) {
+            const vec<bfloat, 8> a = *(const device vec<bfloat, 8>*)(vh + krow[f][i] * D + 16 * d + fn);
+            UNROLL for (short j = 0; j < 4; j++) {
+              v0[4 * i + j] = a[j];
+              v1[4 * i + j] = a[4 + j];
+            }
+          }
+          nax_mma<float, float, bfloat, false>(o[d], o[d + 1], hi[f], v0, v1);
+          nax_mma<float, float, bfloat, false>(o[d], o[d + 1], lo[f], v0, v1);
+        }
+      }
+    }
+
+    UNROLL for (short i = 0; i < 2; i++) {
+      if (!row_ok[i]) continue;
+      const float rr = l[i] == 0.0f ? 0.0f : 1.0f / l[i];
+      device bfloat* orow = (device bfloat*)out + (size_t(kvh * GQA + fm + 8 * i) * L + tq) * D + sg * 128 + fn;
+      UNROLL for (short d = 0; d < 8; d += 2) {
+        vec<bfloat, 8> w;
+        UNROLL for (short j = 0; j < 4; j++) {
+          w[j] = bfloat(o[d][4 * i + j] * rr);
+          w[4 + j] = bfloat(o[d + 1][4 * i + j] * rr);
+        }
+        *(device vec<bfloat, 8>*)(orow + 16 * d + fn) = w;
+      }
+    }"""
+
+PREFILL_PROBE_KEY = "qsa_prefill:" + hashlib.sha256((_PREFILL_HEADER + _PREFILL_SOURCE).encode()).hexdigest()[:12]
+PREFILL_MIN_ROWS = 64  # fewer rows run faster on the native kernel at long contexts
+
+
+@functools.cache
+def _prefill_kernel():
+    return mx.fast.metal_kernel(
+        name = "unsloth_qsa_prefill", input_names = ["q", "k", "v", "sel", "query_ends", "params", "scale"],
+        output_names = ["out"], header = _PREFILL_HEADER, source = _PREFILL_SOURCE,
+    )
+
+
+def fast_prefill_supported(queries, keys, block_indices, block_size):
+    """Whether `fast_prefill_attention` covers this indexed prefill call: the measured Qwen3.8 layout."""
+    B, H, L, D = queries.shape
+    return (B == 1 and H == 24 and keys.shape[1] == 2 and D == 256 and block_size == 4
+            and block_indices.shape[-1] == 512 and L >= PREFILL_MIN_ROWS and queries.dtype == mx.bfloat16)
+
+
+def fast_prefill_attention(queries, keys, values, block_indices, query_ends, scale):
+    """mlx-vlm's indexed QSA prefill attention on the tensor units, for `fast_prefill_supported` calls."""
+    _, H, L, D = queries.shape
+    return _prefill_kernel()(
+        inputs = [queries, keys, values, mx.sort(block_indices.astype(mx.int32), axis = -1),
+                  query_ends.astype(mx.int32), mx.array([keys.shape[2], L], dtype = mx.int32),
+                  mx.array([scale], dtype = mx.float32)],
+        template = [("GQA", H // keys.shape[1]), ("TOPK", block_indices.shape[-1])],
+        grid = (64 * L, keys.shape[1], 1), threadgroup = (64, 1, 1),
+        output_shapes = [(1, H, L, D)], output_dtypes = [queries.dtype],
+    )[0]
+
+
+# The same prefill on simdgroup matrices, for GPUs without tensor units: MLX's steel flash attention
+# (steel/attn/kernels/steel_attention.h and mma.h, Copyright © 2024-25 Apple Inc., MIT) over gathered keys.
+# A threadgroup is one (query row, KV head); its two simdgroups own 8 of the 16 padded query-head rows each.
+# Keys come 64 at a time in the tensor-unit kernel's order, and each 32-wide slice of D is gathered with
+# its query slice into threadgroup memory, so a tile costs 5 KB and several threadgroups share a core.
+_SIMD_PREFILL_SOURCE = """
+    constexpr int D = 256;
+    constexpr int BK = 64;
+    constexpr int DC = 32;
+    const ushort tid = thread_index_in_threadgroup;
+    const ushort lane = thread_index_in_simdgroup;
+    const short sg = simdgroup_index_in_threadgroup;
+    const int tq = threadgroup_position_in_grid.x;
+    const int kvh = threadgroup_position_in_grid.y;
+    const int kL = params[0];
+    const int L = params[1];
+    const float scale2 = scale[0] * 1.44269504089f;
+    threadgroup bfloat qs[16 * DC];
+    threadgroup bfloat ts[BK * DC];
+    threadgroup int rows[BK];
+
+    // MLX's 8x8 fragment layout (steel/attn/mma.h): this lane holds row fm, columns fn and fn + 1.
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) + ((lane >> 1) & 3);
+    const short fn = (qid & 2) * 2 + (lane & 1) * 2;
+    const short qrow = sg * 8 + fm;
+
+    const int qe = query_ends[tq];
+    const int complete = qe >> 2;
+    const int nsel = min(TOPK, complete);
+    const int ntail = qe - (complete << 2);
+    const int NK = 4 * (nsel + (ntail > 0 ? 1 : 0));
+    const device int* blk = sel + size_t(tq) * TOPK + (TOPK - nsel);
+    const device bfloat* qh = (const device bfloat*)q + size_t(kvh * GQA) * L * D + size_t(tq) * D;
+    const device bfloat* kh = (const device bfloat*)k + size_t(kvh) * kL * D;
+    const device bfloat* vh = (const device bfloat*)v + size_t(kvh) * kL * D;
+
+    simdgroup_matrix<float, 8, 8> o[D / 8];
+    UNROLL for (short d = 0; d < D / 8; d++) o[d] = simdgroup_matrix<float, 8, 8>(0);
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int t0 = 0; t0 < NK; t0 += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int s = tid; s < BK; s += 64) {
+        const int slot = t0 + s, u = slot >> 2, j = slot & 3;
+        int r = -1;
+        if (u < nsel) {
+          const int b = blk[u];
+          // mlx-vlm sends no pick outside [0, complete); skipping them keeps any input from addressing past the keys.
+          if (uint(b) < uint(complete)) r = 4 * b + j;
+        } else if (slot < NK && j < ntail) {
+          r = 4 * complete + j;
+        }
+        rows[s] = r < kL ? r : -1;
+      }
+
+      simdgroup_matrix<float, 8, 8> sc[BK / 8];
+      UNROLL for (short j = 0; j < BK / 8; j++) sc[j] = simdgroup_matrix<float, 8, 8>(0);
+      for (short c = 0; c < D; c += DC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < BK * DC / 8; i += 64) {
+          const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
+          *(threadgroup vec<bfloat, 8>*)(ts + r * DC + cc) =
+              *(const device vec<bfloat, 8>*)(kh + size_t(max(rows[r], 0)) * D + c + cc);
+        }
+        for (int i = tid; i < 16 * DC / 8; i += 64) {
+          const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
+          *(threadgroup vec<bfloat, 8>*)(qs + r * DC + cc) =
+              r < GQA ? *(const device vec<bfloat, 8>*)(qh + size_t(r) * L * D + c + cc) : vec<bfloat, 8>(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        UNROLL for (short kk = 0; kk < DC; kk += 8) {
+          simdgroup_matrix<float, 8, 8> a;
+          a.thread_elements()[0] = float(qs[qrow * DC + kk + fn]);
+          a.thread_elements()[1] = float(qs[qrow * DC + kk + fn + 1]);
+          UNROLL for (short j = 0; j < BK / 8; j++) {
+            simdgroup_matrix<float, 8, 8> b;  // b[r][n] = K[key 8j + n][dim kk + r]
+            b.thread_elements()[0] = float(ts[(8 * j + fn) * DC + kk + fm]);
+            b.thread_elements()[1] = float(ts[(8 * j + fn + 1) * DC + kk + fm]);
+            simdgroup_multiply_accumulate(sc[j], a, b, sc[j]);
+          }
+        }
+      }
+
+      float smax = -INFINITY;
+      UNROLL for (short j = 0; j < BK / 8; j++) {
+        UNROLL for (short e = 0; e < 2; e++) {
+          const float x = rows[8 * j + fn + e] >= 0 ? sc[j].thread_elements()[e] * scale2 : -INFINITY;
+          sc[j].thread_elements()[e] = x;
+          smax = metal::max(smax, x);
+        }
+      }
+      const float mnew = metal::max(m, row_max(smax));
+      const float mref = mnew == -INFINITY ? 0.0f : mnew;
+      const float factor = fast::exp2(m - mref);
+      m = mnew;
+      float psum = 0.0f;
+      UNROLL for (short j = 0; j < BK / 8; j++) {
+        UNROLL for (short e = 0; e < 2; e++) {
+          const float p = fast::exp2(sc[j].thread_elements()[e] - mref);
+          sc[j].thread_elements()[e] = p;
+          psum += p;
+        }
+      }
+      l = l * factor + row_sum(psum);
+      UNROLL for (short d = 0; d < D / 8; d++) {
+        o[d].thread_elements()[0] *= factor;
+        o[d].thread_elements()[1] *= factor;
+      }
+
+      // Unrolled, so the o[] fragments this chunk updates are known at compile time and stay in registers.
+      UNROLL for (short c = 0; c < D; c += DC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < BK * DC / 8; i += 64) {
+          const int r = i / (DC / 8), cc = (i % (DC / 8)) * 8;
+          *(threadgroup vec<bfloat, 8>*)(ts + r * DC + cc) =
+              *(const device vec<bfloat, 8>*)(vh + size_t(max(rows[r], 0)) * D + c + cc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        UNROLL for (short dd = 0; dd < DC; dd += 8) {
+          UNROLL for (short j = 0; j < BK / 8; j++) {
+            simdgroup_matrix<float, 8, 8> b;  // b[r][n] = V[key 8j + r][dim dd + n]
+            b.thread_elements()[0] = float(ts[(8 * j + fm) * DC + dd + fn]);
+            b.thread_elements()[1] = float(ts[(8 * j + fm) * DC + dd + fn + 1]);
+            simdgroup_multiply_accumulate(o[(c + dd) / 8], sc[j], b, o[(c + dd) / 8]);
+          }
+        }
+      }
+    }
+
+    if (qrow < GQA) {
+      const float rr = l == 0.0f ? 0.0f : 1.0f / l;
+      device bfloat* orow = (device bfloat*)out + (size_t(kvh * GQA + qrow) * L + tq) * D + fn;
+      UNROLL for (short d = 0; d < D / 8; d++) {
+        vec<bfloat, 2> w;
+        w[0] = bfloat(o[d].thread_elements()[0] * rr);
+        w[1] = bfloat(o[d].thread_elements()[1] * rr);
+        *(device vec<bfloat, 2>*)(orow + 8 * d) = w;
+      }
+    }"""
+
+_SIMD_PREFILL_HEADER = '\n#define UNROLL _Pragma("clang loop unroll(full)")\n' + _ROW_REDUCE
+SIMD_PREFILL_PROBE_KEY = "qsa_simd_prefill:" + hashlib.sha256(
+    (_SIMD_PREFILL_HEADER + _SIMD_PREFILL_SOURCE).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _simd_prefill_kernel():
+    return mx.fast.metal_kernel(
+        name = "unsloth_qsa_simd_prefill", input_names = ["q", "k", "v", "sel", "query_ends", "params", "scale"],
+        output_names = ["out"], header = _SIMD_PREFILL_HEADER, source = _SIMD_PREFILL_SOURCE,
+    )
+
+
+def simd_prefill_supported(queries, keys, block_indices, block_size):
+    """Whether `simd_prefill_attention` covers this indexed prefill call."""
+    B, H, L, D = queries.shape
+    KV = keys.shape[1]
+    return (B == 1 and D == 256 and block_size == 4 and H % KV == 0 and H // KV <= 16 and L >= PREFILL_MIN_ROWS
+            and queries.dtype == keys.dtype == mx.bfloat16)
+
+
+def simd_prefill_attention(queries, keys, values, block_indices, query_ends, scale):
+    """mlx-vlm's indexed QSA prefill attention on simdgroup matrices, for `simd_prefill_supported` calls."""
+    _, H, L, D = queries.shape
+    return _simd_prefill_kernel()(
+        inputs = [queries, keys, values, mx.sort(block_indices.astype(mx.int32), axis = -1),
+                  query_ends.astype(mx.int32), mx.array([keys.shape[2], L], dtype = mx.int32),
+                  mx.array([scale], dtype = mx.float32)],
+        template = [("GQA", H // keys.shape[1]), ("TOPK", block_indices.shape[-1])],
+        grid = (64 * L, keys.shape[1], 1), threadgroup = (64, 1, 1),
+        output_shapes = [(1, H, L, D)], output_dtypes = [queries.dtype],
+    )[0]
+
+
+def probe_fast_prefill():
+    """Check the tensor-unit kernel against fp32 attention."""
+    _probe_prefill(fast_prefill_attention)
+
+
+def probe_simd_prefill():
+    """Check the simdgroup kernel against fp32 attention."""
+    _probe_prefill(simd_prefill_attention)
+
+
+def _fp32_prefill(queries, keys, values, picks, ends, scale):
+    """fp32 attention over each row's visible keys (picked complete blocks plus partial tail), on the CPU since some
+    GPUs run fp32 matmuls at reduced precision; no mlx-vlm import, which costs seconds."""
+    with mx.stream(mx.cpu):
+        _, H, L, _ = queries.shape
+        kL, nb = keys.shape[2], (keys.shape[2] + 3) // 4
+        complete, end, token = ends[0, :, None] // 4, ends[0, :, None], mx.arange(kL)
+        picks = mx.where((picks[0] >= 0) & (picks[0] < complete), picks[0], nb)  # unused picks: a column no key reads
+        blocks = mx.put_along_axis(mx.zeros((L, nb + 1), mx.bool_), picks, mx.array(True), axis = -1)
+        visible = mx.take(blocks, token // 4, axis = 1) | ((token // 4 == complete) & (token < end))
+        k, v = (mx.repeat(x[0].astype(mx.float32), H // keys.shape[1], axis = 0) for x in (keys, values))
+        s = mx.where(visible, queries[0].astype(mx.float32) @ k.transpose(0, 2, 1) * scale, -mx.inf)
+        m = mx.max(s, axis = -1, keepdims = True)
+        w = mx.where(visible, mx.exp(s - mx.where(m == -mx.inf, 0, m)), 0)
+        total = w.sum(-1, keepdims = True)
+        return ((w @ v) / mx.where(total == 0, 1, total)).astype(queries.dtype)[None]
+
+
+def _probe_cases():
+    """Shuffled picks, -1 picks, tail blocks and rows with no visible key, as (q, k, v, picks, ends)."""
+    for L, N in ((64, 4101), (96, 1501), (64, 63)):
+        q = mx.random.normal((1, 24, L, 256), key = mx.random.key(N + L)).astype(mx.bfloat16)
+        k, v = (mx.random.normal((1, 2, N, 256), key = mx.random.key(N + i)).astype(mx.bfloat16) for i in (0, 1))
+        ends = mx.arange(N - L + 1, N + 1, dtype = mx.int32)[None]
+        complete = ends // 4
+        blocks = max(N // 4, 512)
+        scores = mx.random.uniform(shape = (1, L, blocks), key = mx.random.key(3))
+        scores = mx.where(mx.arange(blocks)[None, None] < complete[..., None], scores, -mx.inf)
+        picks = mx.argpartition(scores, kth = -512, axis = -1)[..., -512:].astype(mx.int32)
+        drop = (mx.random.uniform(shape = picks.shape, key = mx.random.key(5)) < 0.05) | (ends[..., None] == 4)
+        picks = mx.where((picks < complete[..., None]) & ~drop, picks, -1)
+        shuffle = mx.argsort(mx.random.uniform(shape = picks.shape, key = mx.random.key(4)), axis = -1)
+        yield q, k, v, mx.take_along_axis(picks, shuffle, axis = -1), ends
+
+
+def _assert_rounding_close(got, want, case):
+    error = mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max().item()
+    assert error <= 0.02 * mx.abs(want.astype(mx.float32)).max().item(), (case, error)
+    # Only rounding differs (fp32 summation order; the tensor units also round P's last bits), so nearly every bf16 output matches.
+    assert mx.mean(got == want).item() >= 0.99, case
+
+
+def _probe_prefill(attend):
+    for q, k, v, picks, ends in _probe_cases():
+        _assert_rounding_close(attend(q, k, v, picks, ends, 256 ** -0.5),
+                               _fp32_prefill(q, k, v, picks, ends, 256 ** -0.5), q.shape[2:3] + k.shape[2:3])
+
+
+# Causal attention whose every query row is computed the same way in whatever block it comes, so one-token decode
+# and a speculative verify block give each row the same bits. Keys are split every INVARIANT_KEYS from the first:
+# each split's fp32 softmax partials go out, and a row combines the splits its own keys reach, in split order. A
+# threadgroup serves FM rows of one KV head (its query heads' rows, head-major, read in place from a contiguous q)
+# over one split: each of its S / 32 simdgroups scores the rows against 32 keys over the whole head dim on matmul2d,
+# one softmax over the split's scores is shared, and the simdgroups then split the head dim to accumulate P.V.
+# A key past a row's own gets probability 0, which leaves that row's maximum, sum and output unchanged. A row reads its
+# last 16 to 47 keys, from a tile boundary set by its own position, one at a time in position order (_INVARIANT_TAIL),
+# so a draft tree's row can read its ancestors there wherever the block holds them.
+_INVARIANT_SOURCE = """
+    constexpr int NS = S / 32;
+    constexpr int DP = D / NS >= (FM < 16 ? 16 : 8) ? NS : D / 16;   // matmul2d needs a 16-wide side
+    constexpr int PD = D / DP;
+    constexpr int RS = FM / NS;
+    threadgroup float sp[FM * S];
+
+    const uint s = simdgroup_index_in_threadgroup;
+    const ushort lane = thread_index_in_simdgroup;
+    const int h = threadgroup_position_in_grid.x;
+    const int b = threadgroup_position_in_grid.y;
+    const int L = q_shape[2];
+    const int N = k_shape[2];
+    const int Hkv = k_shape[1];
+    const int splits = (N + S - 1) / S;
+    const int rows = L * G;
+    const int frags = (rows + FM - 1) / FM;
+    const int split = threadgroup_position_in_grid.z / frags;
+    const int f0 = threadgroup_position_in_grid.z % frags * FM;
+    const int k0 = split * S;
+    int bound = 0;
+    for (int f = f0; f < min(f0 + FM, rows); ++f) bound = max(bound, _invariant_bound(N - L + depth[f % L]));
+    if (k0 >= bound) return;
+
+    constexpr auto qk_desc = matmul2d_descriptor(FM, 32, D, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto pv_desc = matmul2d_descriptor(FM, PD, S, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+    auto qt = tensor((device T*)(q + b * q_strides[0] + h * G * q_strides[1]), dextents<int, 2>{D, rows}, array<int, 2>{1, D});
+    auto kt = tensor((device T*)(k + b * k_strides[0] + h * k_strides[1]), dextents<int, 2>{D, N}, array<int, 2>{1, int(k_strides[2])});
+    auto vt = tensor((device T*)(v + b * v_strides[0] + h * v_strides[1]), dextents<int, 2>{D, N}, array<int, 2>{1, int(v_strides[2])});
+    auto st = tensor(sp, dextents<int, 2>{S, FM}, array<int, 2>{1, S});
+    auto qf = qt.slice(0, f0);
+    auto kf = kt.slice(0, k0 + int(s) * 32);
+    auto sc = qk_op.template get_destination_cooperative_tensor<decltype(qf), decltype(kf), float>();
+    _Pragma("unroll") for (int i = 0; i < sc.get_capacity(); ++i) if (sc.is_valid_element(i)) sc[i] = 0.0f;
+    qk_op.run(qf, kf, sc);
+    sc.store(tensor(sp + s * 32, dextents<int, 2>{32, FM}, array<int, 2>{1, S}));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Simdgroup s owns rows s * RS..; lane takes keys lane + 32j. The softmax overwrites the scores with P.
+    _Pragma("unroll") for (int i = 0; i < RS; ++i) {
+        const int r = int(s) * RS + i, f = f0 + r;
+        const int visible = f < rows ? _invariant_bound(N - L + depth[f % L]) - k0 : 0;
+        threadgroup float* row = sp + r * S;
+        float x[S / 32], m = -INFINITY, e = 0.0f;
+        _Pragma("unroll") for (int j = 0; j < S / 32; ++j) {
+            x[j] = j * 32 + lane < visible ? row[j * 32 + lane] * scale : -INFINITY;
+            m = max(m, x[j]);
+        }
+        m = simd_max(m);
+        _Pragma("unroll") for (int j = 0; j < S / 32; ++j) {
+            x[j] = x[j] == -INFINITY ? 0.0f : fast::exp(x[j] - m);
+            e += x[j];
+            row[j * 32 + lane] = x[j];
+        }
+        e = simd_sum(e);
+        if (lane == 0 && f < rows) {
+            const ulong slot = (ulong((b * Hkv + h) * rows + f)) * splits + split;
+            stats[slot * 2] = m;
+            stats[slot * 2 + 1] = e;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (int(s) < DP) {
+        auto pf = st.slice(0, 0);
+        auto vf = vt.slice(int(s) * PD, k0);
+        auto o = pv_op.template get_destination_cooperative_tensor<decltype(pf), decltype(vf), float>();
+        _Pragma("unroll") for (int i = 0; i < o.get_capacity(); ++i) if (o.is_valid_element(i)) o[i] = 0.0f;
+        pv_op.run(pf, vf, o);
+        const ulong base = (ulong((b * Hkv + h) * rows + f0)) * splits + split;
+        o.store(tensor(partials + base * D + s * PD, dextents<int, 2>{PD, min(FM, rows - f0)}, array<int, 2>{1, splits * D}));
+    }
+"""
+# Rows are head-major, (b, KV head, query head of its group, position): `out`'s own row order.
+_INVARIANT_REDUCE = """
+    const int d = thread_position_in_threadgroup.x;
+    const int row = threadgroup_position_in_grid.y;
+    const int splits = (N + S - 1) / S;
+    const int used = (_invariant_bound(N - L + depth[row % L]) + S - 1) / S;
+    const ulong base = ulong(row) * splits;
+    float M = tail_stats[row * 2];
+    for (int s = 0; s < used; ++s) M = max(M, stats[(base + s) * 2]);
+    float num = 0.0f, den = 0.0f;
+    for (int s = 0; s < used; ++s) {
+        const float ms = stats[(base + s) * 2];
+        const float w = ms == M ? 1.0f : fast::exp(ms - M);
+        num += w * partials[(base + s) * D + d];
+        den += w * stats[(base + s) * 2 + 1];
+    }
+    const float ms = tail_stats[row * 2];
+    const float w = ms == M ? 1.0f : fast::exp(ms - M);
+    num += w * tail[ulong(row) * D + d];
+    den += w * tail_stats[row * 2 + 1];
+    out[ulong(row) * D + d] = T(num / den);
+"""
+# A row's keys past `_invariant_bound` in fp32, one simdgroup per query head: position order, ancestors through `path`
+# (row r's key at depth d is block row path[r * A + d]) when TREE.
+_INVARIANT_TAIL = """
+    constexpr int QK = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int r = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const ushort lane = thread_index_in_simdgroup;
+    const int L = q_shape[2], N = k_shape[2], H = q_shape[1];
+    const int P = N - L, last = P + depth[r], A = path_shape[1];
+    const device T* qp = q + b * q_strides[0] + h * q_strides[1] + r * q_strides[2] + lane * QK * q_strides[3];
+    const device T* kp = k + b * k_strides[0] + (h / G) * k_strides[1] + lane * QK * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + (h / G) * v_strides[1] + lane * QK * v_strides[3];
+    float qr[QK], o[QK], m = numeric_limits<float>::lowest(), e = 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        qr[j] = float(scale) * qp[j * q_strides[3]];
+        o[j] = 0.0f;
+    }
+    for (int i = _invariant_bound(last); i <= last; ++i) {
+        const int key = TREE && i >= P ? P + path[r * A + i - P] : i;
+        float score = 0.0f;
+        for (int j = 0; j < QK; ++j) score += qr[j] * float(kp[key * k_strides[2] + j * k_strides[3]]);
+        score = simd_sum(score);
+        const float top = max(m, score);
+        const float factor = fast::exp(m - top), weight = fast::exp(score - top);
+        m = top;
+        e = e * factor + weight;
+        for (int j = 0; j < QK; ++j) o[j] = o[j] * factor + weight * float(vp[key * v_strides[2] + j * v_strides[3]]);
+    }
+    const ulong row = (ulong(b) * H + h) * L + r;
+    for (int j = 0; j < QK; ++j) tail[row * D + lane * QK + j] = o[j];
+    if (lane == 0) {
+        tail_stats[row * 2] = m;
+        tail_stats[row * 2 + 1] = e;
+    }
+"""
+_INVARIANT_HEADER = """
+    inline int _invariant_bound(int position) { return max(position - 15, 0) / 32 * 32; }
+"""
+INVARIANT_KEYS = 256
+INVARIANT_PROBE_KEY = "invariant_attention:" + hashlib.sha256(
+    (_INVARIANT_SOURCE + _INVARIANT_TAIL + _INVARIANT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _invariant_kernels():
+    from .nax import _QMM_HEADER
+    return (mx.fast.metal_kernel(name = "unsloth_invariant_attention", input_names = ["q", "k", "v", "scale", "depth"],
+                                 output_names = ["partials", "stats"], header = _QMM_HEADER + _INVARIANT_HEADER,
+                                 source = _INVARIANT_SOURCE, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_invariant_attention_tail", input_names = ["q", "k", "v", "scale", "depth", "path"],
+                                 output_names = ["tail", "tail_stats"], header = _INVARIANT_HEADER, source = _INVARIANT_TAIL,
+                                 ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_invariant_attention_reduce",
+                                 input_names = ["partials", "stats", "tail", "tail_stats", "depth", "L", "N"],
+                                 output_names = ["out"], header = _INVARIANT_HEADER, source = _INVARIANT_REDUCE))
+
+
+def invariant_attention_available():
+    """Whether `invariant_attention` runs here: on tensor units only where NAX is on, else on any Apple GPU."""
+    from . import nax
+    return nax.nax_available() if nax._nax_gpu() else mx.metal.is_available() and nax._gpu_generation() is not None
+
+
+@functools.cache
+def _invariant_frag():
+    # Simdgroup matrices pay for every tile row, and a one-token step's 6-8 query heads fill 8.
+    from .nax import nax_available
+    return 16 if nax_available() else 8
+
+
+def invariant_attention_supported(queries, keys, values):
+    """Whether `invariant_attention` covers these `[B, H, L, D]` arrays; keys and values must have unit feature stride."""
+    return (all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
+            and queries.dtype in (mx.bfloat16, mx.float16) and queries.dtype == keys.dtype == values.dtype
+            and keys.shape == values.shape and queries.shape[0] == keys.shape[0]
+            and queries.shape[3] == keys.shape[3] and keys.shape[3] in (64, 128, 256)
+            and keys.shape[1] > 0 and queries.shape[1] % keys.shape[1] == 0 and 1 <= queries.shape[2] <= keys.shape[2])
+
+
+@functools.lru_cache(maxsize = None)
+def _invariant_depths(rows):
+    depths = mx.arange(rows, dtype = mx.int32)
+    mx.eval(depths)
+    return depths
+
+
+_INVARIANT_NO_PATH = mx.zeros((1, 1), mx.int32)
+
+
+def invariant_attention(queries, keys, values, scale, depth = None, path = None):
+    """Causal attention of a block's last rows over `keys` (row i sees the first N - L + i + 1), each row's bits those
+    of its own one-row call. Given a draft tree's `depth` per row and each row's `path` from the anchor (block rows
+    [L, A]), a row at depth d sees the prefix and its path instead: its bits are its path's chain's."""
+    B, H, L, D = queries.shape
+    kv_heads, N = keys.shape[1], keys.shape[2]
+    G, frag = H // kv_heads, _invariant_frag()
+    rows, splits = L * G, -(-N // INVARIANT_KEYS)
+    first, tail, second = _invariant_kernels()
+    tree = depth is not None
+    depth = depth if tree else _invariant_depths(L)
+    partials, stats = first(
+        inputs = [mx.contiguous(queries), keys, values, scale, depth],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("FM", frag), ("S", INVARIANT_KEYS)],
+        grid = (INVARIANT_KEYS * kv_heads, B, splits * -(-rows // frag)), threadgroup = (INVARIANT_KEYS, 1, 1),
+        output_shapes = [(B * kv_heads * rows * splits * D,), (B * kv_heads * rows * splits * 2,)],
+        output_dtypes = [mx.float32, mx.float32])
+    tails, tail_stats = tail(
+        inputs = [queries, keys, values, scale, depth, path if tree else _INVARIANT_NO_PATH],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("TREE", tree)],
+        grid = (32 * H, L, B), threadgroup = (32, 1, 1),
+        output_shapes = [(B * H * L * D,), (B * H * L * 2,)], output_dtypes = [mx.float32, mx.float32])
+    return second(inputs = [partials, stats, tails, tail_stats, depth, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
+                  grid = (D, B * kv_heads * rows, 1), threadgroup = (D, 1, 1),
+                  output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+# A DFlash drafter layer's attention: every block row reads the whole held window in place, split as above, then the
+# block's own few keys, those not `valid` left out, and a sink per query head, which only takes probability.
+_DRAFT_TAIL = """
+    constexpr int QK = D / 32;
+    const int h = threadgroup_position_in_grid.x;
+    const int r = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const ushort lane = thread_index_in_simdgroup;
+    const int L = q_shape[2], N = k_shape[2], H = q_shape[1];
+    const device T* qp = q + b * q_strides[0] + h * q_strides[1] + r * q_strides[2] + lane * QK * q_strides[3];
+    const device T* kp = k + b * k_strides[0] + (h / G) * k_strides[1] + lane * QK * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + (h / G) * v_strides[1] + lane * QK * v_strides[3];
+    float qr[QK], o[QK], m = SINK ? float(sinks[h]) : numeric_limits<float>::lowest(), e = SINK ? 1.0f : 0.0f;
+    for (int j = 0; j < QK; ++j) {
+        qr[j] = float(scale) * qp[j * q_strides[3]];
+        o[j] = 0.0f;
+    }
+    for (int i = 0; i < N; ++i) {
+        if (!valid[i]) continue;
+        float score = 0.0f;
+        for (int j = 0; j < QK; ++j) score += qr[j] * float(kp[i * k_strides[2] + j * k_strides[3]]);
+        score = simd_sum(score);
+        const float top = max(m, score);
+        const float factor = fast::exp(m - top), weight = fast::exp(score - top);
+        m = top;
+        e = e * factor + weight;
+        for (int j = 0; j < QK; ++j) o[j] = o[j] * factor + weight * float(vp[i * v_strides[2] + j * v_strides[3]]);
+    }
+    const ulong row = (ulong(b) * H + h) * L + r;
+    for (int j = 0; j < QK; ++j) tail[row * D + lane * QK + j] = o[j];
+    if (lane == 0) {
+        tail_stats[row * 2] = m;
+        tail_stats[row * 2 + 1] = e;
+    }
+"""
+# A row's depth then names the end of the window: every split is whole but the last.
+_DRAFT_HEADER = """
+    inline int _invariant_bound(int position) { return position; }
+"""
+DRAFT_PROBE_KEY = "draft_attention:" + hashlib.sha256(
+    (_INVARIANT_SOURCE + _DRAFT_TAIL + _DRAFT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _draft_kernels():
+    from .nax import _QMM_HEADER
+    return (mx.fast.metal_kernel(name = "unsloth_draft_attention", input_names = ["q", "k", "v", "scale", "depth"],
+                                 output_names = ["partials", "stats"], header = _QMM_HEADER + _DRAFT_HEADER,
+                                 source = _INVARIANT_SOURCE, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_draft_attention_tail", input_names = ["q", "k", "v", "scale", "sinks", "valid"],
+                                 output_names = ["tail", "tail_stats"], source = _DRAFT_TAIL, ensure_row_contiguous = False),
+            mx.fast.metal_kernel(name = "unsloth_draft_attention_reduce",
+                                 input_names = ["partials", "stats", "tail", "tail_stats", "depth", "L", "N"],
+                                 output_names = ["out"], header = _DRAFT_HEADER, source = _INVARIANT_REDUCE))
+
+
+@functools.lru_cache(maxsize = None)
+def _draft_depths(rows):
+    depths = mx.full((rows,), rows, mx.int32)
+    mx.eval(depths)
+    return depths
+
+
+def draft_attention_supported(queries, keys, values, block_keys, block_values):
+    return (invariant_attention_supported(queries, keys, values) and keys.shape[0] == 1
+            and block_keys.shape[1:2] == keys.shape[1:2] and block_keys.shape[3] == keys.shape[3]
+            and block_keys.dtype == block_values.dtype == keys.dtype and block_keys.shape == block_values.shape)
+
+
+def draft_attention(queries, keys, values, block_keys, block_values, valid, sinks, scale):
+    """Non-causal attention of `[1, H, L, D]` queries over a held window's `keys` and `values`, read in place, and a
+    block's own, of which only those `valid` count, with one sink per query head. Close to stock's, not its bits."""
+    B, H, L, D = queries.shape
+    kv_heads, N = keys.shape[1], keys.shape[2]
+    G, frag = H // kv_heads, _invariant_frag()
+    rows, splits = L * G, -(-N // INVARIANT_KEYS)
+    first, tail, second = _draft_kernels()
+    depth = _draft_depths(L)
+    queries = mx.contiguous(queries)
+    partials, stats = first(
+        inputs = [queries, keys, values, scale, depth],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("FM", frag), ("S", INVARIANT_KEYS)],
+        grid = (INVARIANT_KEYS * kv_heads, B, splits * -(-rows // frag)), threadgroup = (INVARIANT_KEYS, 1, 1),
+        output_shapes = [(B * kv_heads * rows * splits * D,), (B * kv_heads * rows * splits * 2,)],
+        output_dtypes = [mx.float32, mx.float32])
+    tails, tail_stats = tail(
+        inputs = [queries, block_keys, block_values, scale, _INVARIANT_NO_PATH if sinks is None else sinks.astype(mx.float32), valid],
+        template = [("T", queries.dtype), ("D", D), ("G", G), ("SINK", sinks is not None)],
+        grid = (32 * H, L, B), threadgroup = (32, 1, 1),
+        output_shapes = [(B * H * L * D,), (B * H * L * 2,)], output_dtypes = [mx.float32, mx.float32])
+    return second(inputs = [partials, stats, tails, tail_stats, depth, L, N], template = [("T", queries.dtype), ("D", D), ("S", INVARIANT_KEYS)],
+                  grid = (D, B * kv_heads * rows, 1), threadgroup = (D, 1, 1),
+                  output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
+
+
+def probe_draft_attention():
+    """Within 2% of stock attention's largest output, at window ends on both sides of a key split."""
+    H, KV, D, L = 32, 8, 128, 8
+    for dtype in (mx.bfloat16, mx.float16):
+        k, v = (mx.random.normal((1, KV, 1024, D), key = mx.random.key(i)).astype(dtype) for i in (1, 2))
+        block_k, block_v = (mx.random.normal((1, KV, 12, D), key = mx.random.key(i)).astype(dtype) for i in (3, 4))
+        q = mx.random.normal((1, H, L, D), key = mx.random.key(5)).astype(dtype)
+        valid = mx.arange(12) < 10
+        for n, sinks in [(n, sinks) for n in (1, 255, 256, 257, 1024) for sinks in (None, mx.random.normal((H,), key = mx.random.key(6)).astype(dtype))]:
+            got = draft_attention(q, k[:, :, :n], v[:, :, :n], block_k, block_v, valid, sinks, D ** -0.5)
+            mask = mx.concatenate([mx.ones((n,), mx.bool_), valid])
+            want = mx.fast.scaled_dot_product_attention(q, mx.concatenate([k[:, :, :n], block_k], axis = 2), mx.concatenate([v[:, :, :n], block_v], axis = 2),
+                                                        scale = D ** -0.5, mask = mask[None, None, None], sinks = sinks)
+            error = mx.abs((got - want).astype(mx.float32)).max().item()
+            assert error <= 0.02 * mx.abs(want.astype(mx.float32)).max().item(), (n, error)
+
+
+def probe_invariant_attention():
+    """Every row of causal blocks, on both sides of key split boundaries and through cache-like views, bit for bit its
+    one-row call; each output within 2% of fp32 attention's largest."""
+    for (H, KV, D), dtype in [((24, 4, 256), mx.bfloat16), ((16, 2, 256), mx.float16), ((32, 8, 128), mx.bfloat16),
+                              ((16, 4, 64), mx.bfloat16), ((12, 12, 128), mx.bfloat16)]:
+        k, v = (mx.random.normal((1, KV, 1024, D), key = mx.random.key(D + i)).astype(dtype) for i in (0, 1))
+        for prefix, L in ((0, 1), (254, 5), (511, 17), (760, 2), (1007, 17)):
+            q = mx.random.normal((1, H, L, D), key = mx.random.key(prefix + L)).astype(dtype)
+            n = prefix + L
+            got = invariant_attention(q, k[:, :, :n], v[:, :, :n], D ** -0.5)
+            for i in range(L):
+                row = invariant_attention(q[:, :, i:i + 1], k[:, :, :prefix + i + 1], v[:, :, :prefix + i + 1], D ** -0.5)
+                assert mx.array_equal(row.view(mx.uint16), got[:, :, i:i + 1].view(mx.uint16)).item(), (H, KV, D, prefix, i)
+            with mx.stream(mx.cpu):
+                kf, vf = (mx.repeat(x[0, :, :n].astype(mx.float32), H // KV, axis = 0) for x in (k, v))
+                s = q[0].astype(mx.float32) @ kf.transpose(0, 2, 1) * D ** -0.5
+                s = mx.where(mx.arange(n)[None] <= prefix + mx.arange(L)[:, None], s, -mx.inf)
+                want = mx.softmax(s, axis = -1) @ vf
+            error = mx.abs(got[0].astype(mx.float32) - want).max().item()
+            assert error <= 0.02 * mx.abs(want).max().item(), (H, KV, D, prefix, L, error)
+        # A tree's rows, across a tile and a split boundary: each its own path's chain, whatever its block holds.
+        parents = [-1, 0, 1, 1, 3, 0, 5, 6]
+        depth, paths = [], []
+        for parent in parents:
+            depth.append(0 if parent < 0 else depth[parent] + 1)
+            paths.append(([] if parent < 0 else paths[parent]) + [len(paths)])
+        A = max(depth) + 1
+        table = mx.array([path + [0] * (A - len(path)) for path in paths], mx.int32)
+        for prefix in (0, 40, 250, 1000):
+            q = mx.random.normal((1, H, len(parents), D), key = mx.random.key(prefix + 7)).astype(dtype)
+            n = prefix + len(parents)
+            got = invariant_attention(q, k[:, :, :n], v[:, :, :n], D ** -0.5, mx.array(depth, mx.int32), table)
+            for row, path in enumerate(paths):
+                order = mx.array(list(range(prefix)) + [prefix + i for i in path])
+                one = invariant_attention(q[:, :, row:row + 1], k[:, :, order], v[:, :, order], D ** -0.5)
+                assert mx.array_equal(one.view(mx.uint16), got[:, :, row:row + 1].view(mx.uint16)).item(), (H, KV, D, prefix, row)

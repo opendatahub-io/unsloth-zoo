@@ -94,29 +94,23 @@ def test_offloaded_embedding_reads_finished_input_ids():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 @pytest.mark.parametrize("ids_in_graph", [True, False], ids = ["ids_from_graph", "ids_as_input"])
 def test_offloaded_embedding_op_under_cuda_graphs(ids_in_graph):
-    """The offloaded lookup op used inside a compiled, CUDA graphed step: fullgraph, and the same
-    rows as eager while the ids change every step. (The race it removes, a CPU lookup reading ids
-    a graph partition had not copied back yet, showed on a whole gpt-oss decode step at batch 4;
-    this small graph does not reproduce it.)
-
-    Inductor config is pinned: importing unsloth sets memory_planning = True globally, and with
-    it Inductor (2.13 and 2.14 alike) places a partition output (the argmax ids) and a later
-    buffer of the same partition at one pool offset, so the ids are overwritten before the op
-    runs, whatever the op does. ids_from_graph therefore runs without memory planning;
-    ids_as_input is the production shape (GptOssModel.forward receives input_ids as a graph
-    input) and runs under Unsloth's memory planning settings."""
+    """Offloaded lookup op in a fullgraph CUDA-graph step must match eager as ids change; Inductor 2.13/2.14 memory
+    planning (set on by importing unsloth) overwrites argmax ids before the op runs, so ids_from_graph disables it
+    and ids_as_input (production shape) keeps it."""
     from unsloth_zoo.temporary_patches.gpt_oss import _offloaded_embedding
     if _offloaded_embedding is None:
         pytest.skip("torch.library.custom_op unavailable")
     import torch._inductor.config as inductor_config
     torch.manual_seed(0)
+    # Inductor skips bf16 graphs on GPUs without native bf16 (T4), where models run in fp16 anyway.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
     V, H = 50021, 64
-    weight = torch.randn(V, H, dtype = torch.bfloat16)
-    proj = torch.randn(H, V, device = "cuda", dtype = torch.bfloat16)
+    weight = torch.randn(V, H, dtype = dtype)
+    proj = torch.randn(H, V, device = "cuda", dtype = dtype)
 
     def lookup(ids):
         emb = _offloaded_embedding(ids, weight)
-        return (emb[:, 0].float() @ proj.float()).to(torch.bfloat16)
+        return (emb[:, 0].float() @ proj.float()).to(dtype)
 
     def step(logits):
         # Next ids come from a GPU op, as in generate, then go through the CPU table.
@@ -128,7 +122,7 @@ def test_offloaded_embedding_op_under_cuda_graphs(ids_in_graph):
         compiled, prep, config = lookup, (lambda x: x.argmax(-1, keepdim = True)), \
             dict(memory_planning = True, memory_pool = "none")
     compiled = torch.compile(compiled, fullgraph = True, mode = "reduce-overhead")
-    logits = torch.randn(4, V, device = "cuda", dtype = torch.bfloat16)
+    logits = torch.randn(4, V, device = "cuda", dtype = dtype)
     ref = logits.clone()
     with torch.no_grad(), inductor_config.patch(config):
         for _ in range(12):
@@ -186,6 +180,5 @@ def test_compiled_training_keeps_offloaded_embedding_differentiable():
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
     res = json.loads(lines[-1][len("RESULT "):])
-    # The lookup op has no backward: compiled training must keep nn.Embedding, inference uses the op.
-    # Frozen-embedding training keeps nn.Embedding too, so enable_input_require_grads' hook runs.
+    # The lookup op has no backward: compiled and frozen-embedding training keep nn.Embedding (so enable_input_require_grads' hook runs); inference uses the op.
     assert res["grad"] and res["train_calls"] == 0 and res["frozen_hooked"] > 0 and res["infer_calls"] > 0, res

@@ -29,12 +29,26 @@ __all__ = [
     "unsloth_fused_lm_head_loss",
 ]
 
+import inspect
+
 import torch
 
+from . import cross_entropy_loss as _ce
 from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
 
 
 EMPTY_LOGITS = torch.empty(0)
+
+# Kwargs the fused CE reads; extras (HF output_attentions / output_hidden_states) make _use_chunked_ce refuse the kernel.
+_KERNEL_KWARGS = frozenset(_ce._FUSED_LINEAR_CE_KWARGS) | frozenset(("n_chunks",)) | frozenset(
+    inspect.signature(_ce.unsloth_fused_ce_loss).parameters
+) - frozenset(("trainer", "hidden_states", "lm_head_weight", "lm_head_bias", "labels", "n_items", "shift_labels",
+               "kwargs"))
+
+
+def lm_head_on_old_cuda_arch(weight):
+    """Replaced by unsloth_zoo.compiler.lm_head_on_old_cuda_arch, which owns the pre-Turing card set."""
+    return False
 
 
 def unsloth_fused_lm_head_loss(
@@ -81,7 +95,18 @@ def unsloth_fused_lm_head_loss(
         target = labels
         do_shift = True
 
+    # fp16: grads are computed in the forward and underflow without the loss scale (#3529).
+    accelerator_scaler = kwargs.pop("accelerator_scaler", None)
+    if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
+        kwargs["scaling"] = accelerator_scaler
+
+    kwargs = {k: v for k, v in kwargs.items() if k in _KERNEL_KWARGS}
+
     unsloth_fsdp_unshard(lm_head)
+    # A head on a pre-Turing card skips Inductor. Asked after unshard: FSDP2 CPUOffloadPolicy keeps
+    # the shard on CPU until then.
+    if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):
+        kwargs["torch_compile"] = False
     loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,

@@ -14,24 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression test for PR #826.
-
-Making convert_moe_packed_tensors survive a missing _cpu variant is not enough on its
-own: when convert_moe_packed_tensors_cpu is absent, the base bound in saving_utils is
-stock transformers' convert_moe_packed_tensors, which already returns the transposed
-GPT-OSS layout (`return out.transpose(1, 2).contiguous()`). saving_utils then applies its
-OWN .transpose(1, 2), so with the stock base the exported mxfp4 weight is DOUBLE
-transposed (dims 1 and 2 swapped) and silently corrupted.
-
-This test runs the real _merge_and_overwrite_lora_mxfp4 converter on a tiny fake mxfp4
-file in two import orderings and asserts they produce byte-identical output:
-
-  * without the Unsloth mxfp4 patch  -> _cpu absent, base is stock (self-transposing)
-  * with the Unsloth mxfp4 patch     -> _cpu present, base is no-self-transpose
-
-Before the fix the first ordering yields shape (E, D, G*B*2) and the second (E, G*B*2, D):
-they differ by a transpose. After the fix both yield the correct (E, G*B*2, D) layout.
-"""
+"""Regression for PR 826: with convert_moe_packed_tensors_cpu absent, stock transformers' self-transposing base plus
+saving_utils' own transpose double-transposes mxfp4 exports; both import orders must match."""
 import os
 import subprocess
 import sys
@@ -48,10 +32,10 @@ _RUNNER = textwrap.dedent(
     import torch
     from safetensors.torch import save_file, safe_open
 
-    mode, outfile = sys.argv[1], sys.argv[2]
+    mode, outfile, B = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
     torch.manual_seed(0)
-    E, D, G, B = 2, 6, 4, 8            # dequant last dim = G*B*2 = 64
+    E, D, G = 2, 6, 4                  # dequant last dim = G*B*2
     blocks = torch.randint(0, 256, (E, D, G, B), dtype=torch.uint8)
     scales = torch.randint(120, 135, (E, D, G), dtype=torch.uint8)
 
@@ -81,32 +65,32 @@ _RUNNER = textwrap.dedent(
 )
 
 
-def _run(mode, outfile):
+def _run(mode, outfile, B):
     env = dict(os.environ)
     r = subprocess.run(
-        [sys.executable, "-c", _RUNNER, mode, outfile],
+        [sys.executable, "-c", _RUNNER, mode, outfile, str(B)],
         capture_output=True, text=True, env=env,
     )
     assert r.returncode == 0, f"mode={mode} failed:\nstdout={r.stdout}\nstderr={r.stderr}"
     return r.stdout
 
 
-def test_mxfp4_export_layout_matches_with_and_without_cpu_variant():
-    # transformers.integrations.mxfp4 only exists from ~4.55 (GPT-OSS); on the older
-    # transformers unsloth_zoo still supports (pin floor 4.51.3) the subprocess converter
-    # below cannot run, so skip cleanly rather than error.
+# B = 16 is the real MXFP4 block (the GPU fast path); B = 8 takes the generic loop.
+@pytest.mark.parametrize("B", [8, 16])
+def test_mxfp4_export_layout_matches_with_and_without_cpu_variant(B):
+    # transformers.integrations.mxfp4 exists only from ~4.55 (GPT-OSS); older transformers (pin floor 4.51.3) cannot run the subprocess converter, so skip.
     pytest.importorskip("transformers.integrations.mxfp4")
     import torch
     with tempfile.TemporaryDirectory() as d:
         stock = os.path.join(d, "stock.pt")
         patched = os.path.join(d, "patched.pt")
-        out_stock = _run("stock", stock)      # _cpu absent -> stock self-transposing base
-        out_patched = _run("patched", patched)  # _cpu present -> Unsloth no-self-transpose base
+        out_stock = _run("stock", stock, B)      # _cpu absent -> stock self-transposing base
+        out_patched = _run("patched", patched, B)  # _cpu present -> Unsloth no-self-transpose base
         Ws = torch.load(stock)
         Wp = torch.load(patched)
-        # The correct GPT-OSS layout is [E, G*B*2, D] == (2, 64, 6).
-        assert tuple(Wp.shape) == (2, 64, 6), (out_patched, Wp.shape)
-        assert tuple(Ws.shape) == (2, 64, 6), (
+        # The correct GPT-OSS layout is [E, G*B*2, D].
+        assert tuple(Wp.shape) == (2, 8 * B, 6), (out_patched, Wp.shape)
+        assert tuple(Ws.shape) == (2, 8 * B, 6), (
             "missing-_cpu export is double-transposed (wrong layout)", out_stock, Ws.shape,
         )
         assert torch.equal(Ws, Wp), "missing-_cpu export does not match the patched export"

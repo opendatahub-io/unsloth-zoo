@@ -29,7 +29,7 @@ def l2norm_fwd_kernel1(
     rstd,
     eps,
     D,
-    BD: tl.constexpr,
+    BD: tl.constexpr,  # block along D
 ):
     i_t = tl.program_id(0)
     x += i_t * D
@@ -58,7 +58,7 @@ def l2norm_bwd_kernel1(
     dx,
     eps,
     D,
-    BD: tl.constexpr,
+    BD: tl.constexpr,  # block along D
 ):
     i_t = tl.program_id(0)
     y += i_t * D
@@ -76,7 +76,7 @@ def l2norm_bwd_kernel1(
 
 @fla_cache_autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
-    key=["D", "NB"],
+    key=["D"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -86,10 +86,9 @@ def l2norm_fwd_kernel(
     rstd,
     eps,
     T,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-    NB: tl.constexpr,
-    BT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BD: tl.constexpr,  # block along D
+    BT: tl.constexpr,  # rows per program
 ):
     i_t = tl.program_id(0).to(tl.int64)
     o_t = i_t * BT + tl.arange(0, BT)
@@ -110,7 +109,7 @@ def l2norm_fwd_kernel(
 
 @fla_cache_autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
-    key=["D", "NB"],
+    key=["D"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -121,10 +120,9 @@ def l2norm_bwd_kernel(
     dx,
     eps,
     T,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-    NB: tl.constexpr,
-    BT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BD: tl.constexpr,  # block along D
+    BT: tl.constexpr,  # rows per program
 ):
     i_t = tl.program_id(0).to(tl.int64)
     o_t = i_t * BT + tl.arange(0, BT)
@@ -165,10 +163,7 @@ def l2norm_fwd(
 
     rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     if D <= 512:
-        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
-        # of T before recompiling the kernel.
-        # NB = triton.cdiv(T, 2048)
-        NB = triton.cdiv(T, 2048 * 32)
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -181,7 +176,6 @@ def l2norm_fwd(
             T=T,
             D=D,
             BD=BD,
-            NB=NB,
         )
     else:
         l2norm_fwd_kernel1[(T,)](
@@ -215,10 +209,7 @@ def l2norm_bwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
-        # of T before recompiling the kernel.
-        # NB = triton.cdiv(T, 2048)
-        NB = triton.cdiv(T, 2048 * 32)
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -232,7 +223,6 @@ def l2norm_bwd(
             T=T,
             D=D,
             BD=BD,
-            NB=NB,
         )
     else:
         l2norm_bwd_kernel1[(T,)](

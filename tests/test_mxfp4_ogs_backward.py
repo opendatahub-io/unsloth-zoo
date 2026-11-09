@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native MXFP4 gpt-oss experts (triton_kernels matmul_ogs) train: backward vs an fp32 reference on the
-exact dequantized weights."""
+"""Native MXFP4 gpt-oss experts (triton_kernels matmul_ogs) train; backward is checked against an fp32 reference on the exact dequantized weights."""
 
 import importlib
 import types
@@ -59,8 +58,14 @@ def _tk(name):
     return importlib.import_module(f"{_triton_kernels().__name__}.{name}")
 
 
+def _backend():
+    from unsloth_zoo.triton_kernels_compat import triton_kernels_backend_for
+    return triton_kernels_backend_for(_triton_kernels())
+
+
 def _module(E, H, I, gen):
-    mo, tt, L = _tk("matmul_ogs"), _tk("tensor"), _tk("tensor_details.layout")
+    backend = _backend()
+    tt, L = backend.tensor, backend.layout
     from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize
 
     def packed(N, K):
@@ -75,7 +80,7 @@ def _module(E, H, I, gen):
         weight = tt.convert_layout(tt.wrap_torch_tensor(flat.transpose(-2, -1), dtype = tt.FP4), value_layout, **opts)
         scale = tt.convert_layout(tt.wrap_torch_tensor(scales.transpose(-2, -1)), strided)
         weight.shape = torch.Size([E, K, N])
-        return weight, mo.PrecisionConfig(weight_scale = scale, flex_ctx = mo.FlexCtx(rhs_data = mo.InFlexData()))
+        return weight, backend.precision(scale)
 
     gate_up, down = packed(2 * I, H), packed(H, I)
     module = types.SimpleNamespace(alpha = ALPHA, limit = LIMIT, num_experts = E)
@@ -115,7 +120,7 @@ def _reference(x, router, module, dense, k, loras):
 
 
 def _run(E, H, I, T, k, seed, lora_rank = None):
-    rt = _tk("routing")
+    backend = _backend()
 
     gen = torch.Generator(device = "cuda").manual_seed(seed)
     module, dense = _module(E, H, I, gen)
@@ -128,7 +133,7 @@ def _run(E, H, I, T, k, seed, lora_rank = None):
 
     x, router = x0.clone().requires_grad_(), router0.clone().requires_grad_()
     logits = torch.nn.functional.linear(x, router.to(torch.bfloat16))
-    routing_data, gather_idx, scatter_idx = rt.routing(logits, k)
+    routing_data, gather_idx, scatter_idx = backend.routing(logits, k)
     kwargs = {}
     if loras is not None:
         kwargs = dict(gate_up_lora = (*loras[0], 2.0, E), down_lora = (*loras[1], 2.0, E))
